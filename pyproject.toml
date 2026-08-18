@@ -1,0 +1,25 @@
+[project]
+name = "songbird-agent-mcp"
+version = "0.1.0"
+description = "Governed MCP control plane for agent-driven music creation"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Stephen Phillips" }]
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.0.0,<2.0.0"]
+
+[project.scripts]
+songbird-agent-mcp = "songbird_agent_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "fastmcp>=2.0.0",
+    "pytest>=8.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/songbird_agent_mcp"]
