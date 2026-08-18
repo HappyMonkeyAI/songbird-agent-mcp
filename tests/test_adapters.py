@@ -555,6 +555,71 @@ def test_comfy_mix_render_adapter_rejects_gain_length_mismatch(tmp_path):
     store.close()
 
 
+def test_comfy_mix_render_adapter_concat_mode_uses_concat_filter(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id,
+        "ffmpeg_mix",
+        300,
+        "idem-concat",
+        "now",
+        "operator",
+        parameters={
+            "source_audio_uris": [
+                "http://comfy:8188/view?filename=a.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=b.mp3&subfolder=audio&type=output",
+            ],
+            "mode": "concat",
+        },
+    )
+    session.render_request = request
+    captured = []
+
+    def get_json(req, timeout):
+        return FakeResponse(b"MP3BYTES")
+
+    def post_json(req, timeout):
+        return FakeResponse(b'{"name":"MIX_concat_0000.mp3","subfolder":"","type":"output"}')
+
+    def run_cmd(args, capture_output=True, timeout=0):
+        captured.append(args)
+        Path(args[-1]).write_bytes(b"CONCATBYTES")
+        return FakeCompletedProcess(0)
+
+    adapter = ComfyMixRenderAdapter(
+        "http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json, run_cmd=run_cmd
+    )
+    artifact = adapter.render(session, request)
+    filter_idx = captured[0].index("-filter_complex")
+    filter_complex = captured[0][filter_idx + 1]
+    assert "concat=n=2:v=0:a=1[out]" in filter_complex
+    assert "amix" not in filter_complex
+    assert artifact.provenance[0].metadata["mode"] == "concat"
+    assert artifact.uri == "http://comfy:8188/view?filename=MIX_concat_0000.mp3&subfolder=&type=output"
+    store.close()
+
+
+def test_comfy_mix_render_adapter_rejects_invalid_mode(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id, "ffmpeg_mix", 161, "idem-mode", "now", "operator",
+        parameters={
+            "source_audio_uris": [
+                "http://comfy:8188/view?filename=a.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=b.mp3&subfolder=audio&type=output",
+            ],
+            "mode": "fade",
+        },
+    )
+    session.render_request = request
+    adapter = ComfyMixRenderAdapter("http://comfy:8188", tmp_path, timeout=5)
+    with pytest.raises(AdapterError, match="mode"):
+        adapter.render(session, request)
+    store.close()
+
+
 def test_comfy_artifact_qa_verifies_wav_bytes_and_duration():
     _, store, session = make_session()
     session.status = SessionStatus.RENDERING.value

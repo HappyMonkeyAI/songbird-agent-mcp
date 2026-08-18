@@ -671,10 +671,13 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
         gains = request.parameters.get("gains")
         if gains is not None and not (isinstance(gains, list) and len(gains) == len(source_uris) and all(isinstance(g, (int, float)) for g in gains)):
             raise AdapterError("parameters.gains must be a numeric list matching source_audio_uris")
+        mode = request.parameters.get("mode", "mix")
+        if mode not in ("mix", "concat"):
+            raise AdapterError("parameters.mode must be 'mix' or 'concat'")
         payloads = [self._fetch_bytes(uri) for uri in source_uris]
         if not all(payloads):
             raise AdapterError("one or more mix source audio downloads returned no bytes")
-        mixed = self._mix(payloads, gains)
+        mixed = self._mix(payloads, gains, mode=mode)
         if not mixed:
             raise AdapterError("ffmpeg mix produced no output")
         uploaded = self._upload_output(mixed, _sanitize_filename_prefix(session.title or "songbird-mix"))
@@ -693,11 +696,11 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
                 request_id=None,
                 created_at=_now(),
                 source="comfy_mix_render_adapter",
-                metadata={"source_audio_uris": list(source_uris), "gains": list(gains) if gains else None},
+                metadata={"source_audio_uris": list(source_uris), "gains": list(gains) if gains else None, "mode": mode},
             )],
         )
 
-    def _mix(self, payloads: list[bytes], gains: list[float] | None) -> bytes | None:
+    def _mix(self, payloads: list[bytes], gains: list[float] | None, *, mode: str = "mix") -> bytes | None:
         inputs: list[str] = []
         filter_parts: list[str] = []
         for index, payload in enumerate(payloads):
@@ -710,7 +713,10 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
             else:
                 filter_parts.append(f"[{index}:a]anull[{label}]")
         labels = "".join(f"[mix{i}]" for i in range(len(payloads)))
-        filter_parts.append(f"{labels}amix=inputs={len(payloads)}:duration=longest:dropout_transition=0[out]")
+        if mode == "concat":
+            filter_parts.append(f"{labels}concat=n={len(payloads)}:v=0:a=1[out]")
+        else:
+            filter_parts.append(f"{labels}amix=inputs={len(payloads)}:duration=longest:dropout_transition=0[out]")
         output = Path("/tmp") / f"mix_out_{uuid4().hex[:8]}.mp3"
         args = [self._ffmpeg, "-y"]
         for path in inputs:
