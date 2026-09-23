@@ -8,7 +8,11 @@ from songbird_agent_mcp.server import (
     generate_musical_direction,
     approve_render,
     check_provider_health,
+    check_supporting_services,
     dry_run_render,
+    get_genius_song,
+    search_genius_songs,
+    search_lyric_context,
     record_qa,
     render_song,
     qa_artifact,
@@ -66,6 +70,19 @@ def test_unconfigured_health_provider_returns_structured_error():
     assert result == {"error": "provider_not_configured", "provider": "comfyui"}
 
 
+def test_supporting_services_reports_unconfigured_dependencies_without_network_calls():
+    result = check_supporting_services()
+    assert result["status"] == "degraded"
+    assert {item["provider"] for item in result["services"]} == {"comfyui", "lightrag", "perplexica", "ollama"}
+    assert all(item["status"] == "not_configured" for item in result["services"])
+
+
+def test_research_tools_report_unconfigured_backends():
+    assert search_genius_songs("neon") == {"error": "provider_not_configured", "provider": "genius"}
+    assert get_genius_song(123)["error"] == "provider_not_configured"
+    assert search_lyric_context("neon") == {"error": "provider_not_configured", "provider": "lightrag"}
+
+
 def test_unconfigured_artifact_verifier_returns_structured_error():
     result = verify_artifact("missing-session")
     assert result == {"error": "session_not_found", "session_id": "missing-session"}
@@ -84,8 +101,43 @@ def test_dry_run_render_maps_minimax_without_persisting_or_calling_provider():
     assert plan["duration_requested"] == 420
     assert plan["duration_effective"] == 300
     assert plan["parameters"]["generation_seed"] == 7
+    assert plan["parameters"]["generation_mode"] == "segmented_fallback_required"
+    assert plan["parameters"]["structured_caption"]["Global Metadata"] == {
+        "genre": "SYNTHWAVE",
+        "bpm": 118,
+        "key": "F minor",
+        "scale": None,
+    }
     assert plan["side_effects"]
     assert after["revision"] == before["revision"]
+
+
+def test_dry_run_minimax_prefers_native_long_form_and_locks_caption_sections():
+    session = create_song_session("song", "NU_DISCO_ELECTROPOP", "Caption Lock", False)
+    session_id = session["session_id"]
+    submit_creative_stage(session_id, "brief", {"text": "night drive release"})
+    submit_creative_stage(session_id, "persona", {"artist_name": "Mara Vale", "identity": "fictional original artist"})
+    submit_creative_stage(session_id, "musical_direction", {
+        "tags": "nu-disco, electropop",
+        "bpm": 122,
+        "keyscale": "F# minor",
+        "vocal_details": {"artist_name": "Mara Vale", "timbre": "warm, clear female lead"},
+        "arrangement": {"core": "funk bass, rhythm guitar, analog synths", "progression": "restrained verse to wide final chorus"},
+    })
+    submit_creative_stage(session_id, "lyrics_or_prompt", {"text": "[Verse]\nNeon on the glass\n[Chorus]\nTurn the signal on"})
+
+    plan = dry_run_render(session_id, "minimax", 180, "caption-lock", 11)
+
+    assert plan["parameters"]["generation_mode"] == "native_long_form"
+    caption = plan["parameters"]["structured_caption"]
+    assert caption["Global Metadata"] == {
+        "genre": "NU_DISCO_ELECTROPOP",
+        "bpm": 122,
+        "key": "F# minor",
+        "scale": None,
+    }
+    assert caption["Vocal Details"] == {"artist_name": "Mara Vale", "timbre": "warm, clear female lead"}
+    assert caption["Arrangement"] == {"core": "funk bass, rhythm guitar, analog synths", "progression": "restrained verse to wide final chorus"}
 
 
 def test_registered_mock_provider_generates_and_persists_stage():

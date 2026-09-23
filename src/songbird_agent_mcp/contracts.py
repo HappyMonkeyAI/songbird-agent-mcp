@@ -301,6 +301,7 @@ class RenderPlan:
     keyscale: str | None
     parameters: dict[str, Any]
     side_effects: list[str]
+    instrumental_only: bool = False
 
     def __post_init__(self) -> None:
         self.profile_id = _required(self.profile_id, "profile_id")
@@ -334,6 +335,7 @@ class RenderPlan:
             "lyrics_or_prompt": self.lyrics_or_prompt,
             "bpm": self.bpm,
             "keyscale": self.keyscale,
+            "instrumental_only": self.instrumental_only,
             "parameters": deepcopy(self.parameters),
             "side_effects": list(self.side_effects),
         }

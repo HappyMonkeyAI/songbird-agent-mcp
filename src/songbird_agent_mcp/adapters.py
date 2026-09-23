@@ -49,6 +49,122 @@ class OpenAICompatibleAdapterError(AdapterError):
     """Raised when an OpenAI-compatible musical-direction contract fails."""
 
 
+class GeniusAPIAdapter:
+    """Read-only Genius API client returning metadata rather than lyric text."""
+
+    def __init__(self, client_id: str = "", client_secret: str = "", *, access_token: str | None = None, timeout: float = 30.0, opener=urlopen) -> None:
+        if not access_token and (not client_id.strip() or not client_secret.strip()):
+            raise ValueError("Genius access token or client credentials must be provided")
+        self.client_id = client_id.strip()
+        self.client_secret = client_secret.strip()
+        self.timeout = timeout
+        self._opener = opener
+        self._access_token: str | None = access_token.strip() if access_token else None
+        self.base_url = "https://api.genius.com"
+
+    def _request_json(self, request: Request) -> dict[str, Any]:
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Genius response must be a JSON object")
+            return payload
+        except (HTTPError, URLError, TimeoutError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AdapterError(f"Genius API request failed: {exc}") from exc
+
+    def _token(self) -> str:
+        if self._access_token:
+            return self._access_token
+        body = urlencode({
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }).encode("utf-8")
+        payload = self._request_json(Request(
+            f"{self.base_url}/oauth/token",
+            data=body,
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        ))
+        token = payload.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            raise AdapterError("Genius token response did not include access_token")
+        self._access_token = token
+        return token
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        query = f"?{urlencode(params)}" if params else ""
+        return self._request_json(Request(
+            f"{self.base_url}{path}{query}",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {self._token()}"},
+            method="GET",
+        ))
+
+    @staticmethod
+    def _song_metadata(song: dict[str, Any]) -> dict[str, Any]:
+        artist = song.get("primary_artist") or {}
+        return {
+            "id": song.get("id"),
+            "title": song.get("title"),
+            "url": song.get("url"),
+            "artist": artist.get("name") if isinstance(artist, dict) else None,
+            "artist_id": artist.get("id") if isinstance(artist, dict) else None,
+            "album": (song.get("album") or {}).get("name") if isinstance(song.get("album"), dict) else None,
+            "release_date": song.get("release_date_for_display"),
+            "lyrics_state": song.get("lyrics_state"),
+        }
+
+    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        if not query.strip():
+            raise ValueError("Genius search query must be non-empty")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 20:
+            raise ValueError("Genius search limit must be an integer from 1 to 20")
+        payload = self._get("/search", {"q": query.strip(), "per_page": limit})
+        hits = (payload.get("response") or {}).get("hits", [])
+        if not isinstance(hits, list):
+            raise AdapterError("Genius search response did not contain hits")
+        return [self._song_metadata(hit.get("result", {})) for hit in hits if isinstance(hit, dict) and isinstance(hit.get("result"), dict)][:limit]
+
+    def get_song(self, song_id: int) -> dict[str, Any]:
+        if not isinstance(song_id, int) or isinstance(song_id, bool) or song_id <= 0:
+            raise ValueError("Genius song_id must be a positive integer")
+        payload = self._get(f"/songs/{song_id}")
+        song = (payload.get("response") or {}).get("song")
+        if not isinstance(song, dict):
+            raise AdapterError("Genius song response did not contain a song")
+        return self._song_metadata(song)
+
+
+class LightRAGQueryAdapter:
+    """Read-only context-only query adapter for the Songbird lyric corpus."""
+
+    def __init__(self, base_url: str, *, api_key: str | None = None, timeout: float = 180.0, opener=urlopen) -> None:
+        if not base_url.strip():
+            raise ValueError("LightRAG base_url must be non-empty")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or ""
+        self.timeout = timeout
+        self._opener = opener
+
+    def query(self, query: str, *, mode: str = "mix") -> dict[str, Any]:
+        if not query.strip():
+            raise ValueError("LightRAG query must be non-empty")
+        body = json.dumps({"query": query.strip(), "mode": mode, "only_need_context": True, "response_type": "string"}).encode("utf-8")
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            with self._opener(Request(f"{self.base_url}/query", data=body, headers=headers, method="POST"), timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("LightRAG response must be a JSON object")
+        except (HTTPError, URLError, TimeoutError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AdapterError(f"LightRAG query failed: {exc}") from exc
+        context = payload.get("response") or payload.get("output") or payload.get("context") or ""
+        references = payload.get("references") or payload.get("ref_list") or []
+        return {"context": context if isinstance(context, str) else str(context), "references": references if isinstance(references, list) else [], "mode": mode}
+
+
 def _read_json_response(response: Any) -> dict[str, Any]:
     if hasattr(response, "json"):
         payload = response.json()
@@ -308,6 +424,17 @@ class SongbirdDryRunAdapter:
             "kind": "ace_step",
             "workflow": "audio_ace_step_1_5_checkpoint.json",
             "supports_negative_text": True,
+            # Songbird V2's tested ACE-Step 1.5 POP preset. The exported
+            # workflow is a generic fallback (50/euler/CFG 4); leaving those
+            # values untouched produces harsher, less coherent vocal renders.
+            "default_steps": 16,
+            "default_cfg": 1.4,
+            "default_sampler": "dpmpp_2m",
+            "default_scheduler": "sgm_uniform",
+            "default_cfg_scale": 3.5,
+            "default_min_p": 0,
+            "default_negative_prompt": "low quality, glitch, distorted, clipping, harsh artifacts",
+            "default_checkpoint": "ace_step_1.5_turbo_aio.safetensors",
         },
         "ace_step_m2m": {
             "label": "ACE-Step M2M Edit",
@@ -336,6 +463,25 @@ class SongbirdDryRunAdapter:
         },
     }
 
+    @staticmethod
+    def _minimax_caption(session: SongSession, direction: dict[str, Any]) -> dict[str, Any]:
+        vocal_details = direction.get("vocal_details")
+        if not isinstance(vocal_details, dict):
+            vocal_details = {"direction": str(direction.get("vocal_direction", "")).strip()}
+        arrangement = direction.get("arrangement")
+        if not isinstance(arrangement, dict):
+            arrangement = {"direction": str(arrangement or "").strip()}
+        return {
+            "Global Metadata": {
+                "genre": session.genre,
+                "bpm": direction.get("bpm"),
+                "key": direction.get("keyscale"),
+                "scale": direction.get("scale"),
+            },
+            "Vocal Details": vocal_details,
+            "Arrangement": arrangement,
+        }
+
     def plan(self, session: SongSession, model: str, duration: int, filename_prefix: str, generation_seed: int | None = None) -> RenderPlan:
         raw_model = model.strip().lower().replace(" ", "_")
         profile_id = self._ALIASES.get(raw_model, raw_model)
@@ -356,8 +502,25 @@ class SongbirdDryRunAdapter:
             "supports_negative_text": profile["supports_negative_text"],
             "duration_cap_applied": effective_duration != duration,
         }
-        if profile_id == "minimax_music":
+        if profile_id == "ace_step":
+            parameters.update({
+                key: profile[key]
+                for key in (
+                    "default_steps",
+                    "default_cfg",
+                    "default_sampler",
+                    "default_scheduler",
+                    "default_cfg_scale",
+                    "default_min_p",
+                    "default_negative_prompt",
+                    "default_checkpoint",
+                )
+            })
+            parameters["generation_seed"] = generation_seed if generation_seed is not None else session.generation_seed
+        elif profile_id == "minimax_music":
             parameters.update({key: profile[key] for key in ("default_steps", "default_cfg", "default_cfg_scale", "default_sampler", "default_scheduler", "default_top_k")})
+            parameters["generation_mode"] = "native_long_form" if duration <= profile["max_duration_cap"] else "segmented_fallback_required"
+            parameters["structured_caption"] = self._minimax_caption(session, direction)
         if generation_seed is not None:
             parameters["generation_seed"] = generation_seed
         return RenderPlan(
@@ -372,19 +535,21 @@ class SongbirdDryRunAdapter:
             lyrics_or_prompt=lyrics_or_prompt,
             bpm=direction.get("bpm"),
             keyscale=direction.get("keyscale"),
+            instrumental_only=session.instrumental_only,
             parameters=parameters,
             side_effects=["none: dry-run mapping only; no provider call, file write, queue submission, or artifact creation"],
         )
 
 
 class ComfyRenderAdapter:
-    """Opt-in ComfyUI prompt/history render adapter; never writes local artifacts."""
+    """Opt-in ComfyUI render adapter with optional in-process artifact export."""
 
     def __init__(
         self,
         base_url: str,
         workflow_root: str | Path,
         *,
+        output_dir: str | Path | None = None,
         timeout: float = 120.0,
         post_json=urlopen,
         get_json=urlopen,
@@ -394,6 +559,7 @@ class ComfyRenderAdapter:
             raise ValueError("base_url must be a non-empty string")
         self.base_url = base_url.rstrip("/")
         self.workflow_root = Path(workflow_root)
+        self.output_dir = Path(output_dir) if output_dir is not None else None
         self.timeout = timeout
         self._post_json = post_json
         self._get_json = get_json
@@ -412,6 +578,8 @@ class ComfyRenderAdapter:
             _sanitize_filename_prefix(session.title or "songbird"),
             generation_seed=request.parameters.get("seed", session.generation_seed),
         )
+        if plan.parameters.get("supports_negative_text") and request.parameters.get("negative_prompt"):
+            plan.parameters["negative_prompt"] = request.parameters["negative_prompt"]
         workflow_path = self.workflow_root / plan.workflow
         try:
             prompt = json.loads(workflow_path.read_text(encoding="utf-8"))
@@ -428,6 +596,7 @@ class ComfyRenderAdapter:
             raise AdapterError("ComfyUI response did not include prompt_id")
         history = self._wait_for_history(prompt_id)
         file_info = self._extract_file(history, plan.profile_id)
+        local_path = self._export_local_artifact(file_info, plan.filename_prefix, prompt_id)
         query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
         extension = str(file_info.get("filename", "")).lower().rsplit(".", 1)[-1]
         mime_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac"}.get(extension, "audio/octet-stream")
@@ -439,8 +608,21 @@ class ComfyRenderAdapter:
             checksum=None,
             duration_seconds=request.duration_seconds,
             created_at=_now(),
-            provenance=[ProvenanceRecord(provider="comfyui", model=plan.profile_id, request_id=prompt_id, created_at=_now(), source="comfy_render_adapter")],
+            provenance=[ProvenanceRecord(provider="comfyui", model=plan.profile_id, request_id=prompt_id, created_at=_now(), source="comfy_render_adapter", metadata={"local_path": str(local_path) if local_path else None})],
         )
+
+    def _export_local_artifact(self, file_info: dict[str, Any], filename_prefix: str, prompt_id: str) -> Path | None:
+        if self.output_dir is None:
+            return None
+        suffix = Path(str(file_info.get("filename", "song.mp3"))).suffix.lower() or ".mp3"
+        target = self.output_dir / f"{_sanitize_filename_prefix(filename_prefix)}_{prompt_id}{suffix}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
+        data = self._fetch_bytes(f"{self.base_url}/view?{query}")
+        if not data:
+            raise AdapterError("ComfyUI artifact export returned no bytes")
+        target.write_bytes(data)
+        return target
 
     def _apply_plan(self, prompt: dict[str, Any], plan: RenderPlan) -> None:
         if plan.profile_id == "minimax_music":
@@ -448,21 +630,50 @@ class ComfyRenderAdapter:
                 prompt["37:38"]["inputs"]["seed"] = int(plan.parameters["generation_seed"])
             if "37:13" in prompt:
                 inputs = prompt["37:13"]["inputs"]
-                inputs.update({"caption": json.dumps({"tags": plan.tags, "bpm": plan.bpm or 120, "keyscale": plan.keyscale or "C major"}), "lyrics": plan.lyrics_or_prompt, "max_duration": plan.duration_effective, "cfg_scale": plan.parameters["default_cfg_scale"], "top_k": plan.parameters["default_top_k"]})
+                caption = plan.parameters.get("structured_caption") or {"tags": plan.tags, "bpm": plan.bpm or 120, "keyscale": plan.keyscale or "C major"}
+                # Instrumental sessions must not feed the verbal prompt into the
+                # lyrics field: MiniMax sings the lyrics field's text, which would
+                # produce vocals that "sing the musical instructions." Keep the
+                # description in the caption only, and pass empty lyrics.
+                lyrics = "" if plan.instrumental_only else plan.lyrics_or_prompt
+                inputs.update({"caption": json.dumps(caption, ensure_ascii=False), "lyrics": lyrics, "max_duration": plan.duration_effective, "cfg_scale": plan.parameters["default_cfg_scale"], "top_k": plan.parameters["default_top_k"]})
             if "37:9" in prompt:
                 prompt["37:9"]["inputs"].update({"steps": plan.parameters["default_steps"], "cfg": plan.parameters["default_cfg"], "sampler_name": plan.parameters["default_sampler"], "scheduler": plan.parameters["default_scheduler"]})
             if "35" in prompt:
                 prompt["35"]["inputs"]["filename_prefix"] = f"audio/{plan.filename_prefix}"
         else:
+            if "3" in prompt:
+                inputs = prompt["3"]["inputs"]
+                if plan.parameters.get("generation_seed") is not None:
+                    inputs["seed"] = int(plan.parameters["generation_seed"])
+                inputs.update({
+                    "steps": plan.parameters["default_steps"],
+                    "cfg": plan.parameters["default_cfg"],
+                    "sampler_name": plan.parameters["default_sampler"],
+                    "scheduler": plan.parameters["default_scheduler"],
+                })
             if "94" in prompt:
-                prompt["94"]["inputs"].update({"tags": plan.tags, "lyrics": plan.lyrics_or_prompt, "bpm": plan.bpm or 120, "duration": plan.duration_effective, "keyscale": plan.keyscale or "C major"})
+                prompt["94"]["inputs"].update({
+                    "tags": plan.tags,
+                    "lyrics": "" if plan.instrumental_only else plan.lyrics_or_prompt,
+                    "bpm": plan.bpm or 120,
+                    "duration": plan.duration_effective,
+                    "keyscale": plan.keyscale or "C major",
+                    "min_p": plan.parameters.get("default_min_p", 0),
+                    "cfg_scale": plan.parameters.get("default_cfg_scale", 3.5),
+                })
+                if plan.parameters.get("generation_seed") is not None:
+                    prompt["94"]["inputs"]["seed"] = int(plan.parameters["generation_seed"])
+            if "7" in prompt:
+                negative = plan.parameters.get("negative_prompt") or plan.parameters.get("default_negative_prompt", "")
+                prompt["7"]["inputs"]["text"] = negative
             if "98" in prompt:
                 prompt["98"]["inputs"]["seconds"] = plan.duration_effective
             if "104" in prompt:
                 prompt["104"]["inputs"]["filename_prefix"] = f"audio/{plan.filename_prefix}"
 
     def _wait_for_history(self, prompt_id: str) -> dict[str, Any]:
-        attempts = max(1, int(self.timeout / 5))
+        attempts = max(1, math.ceil(self.timeout / 5) + 1)
         for _ in range(attempts):
             response = self._get_json(Request(f"{self.base_url}/history/{prompt_id}", method="GET"), timeout=self.timeout)
             history = _read_json_response(response)
@@ -483,6 +694,14 @@ class ComfyRenderAdapter:
         raise AdapterError("ComfyUI history did not contain an audio file")
 
     def _fetch_bytes(self, uri: str) -> bytes:
+        if not uri.startswith(("http://", "https://")):
+            local = Path(uri)
+            if local.is_file():
+                try:
+                    return local.read_bytes()
+                except OSError:
+                    return b""
+            return b""
         try:
             with self._get_json(Request(uri, method="GET"), timeout=self.timeout) as response:
                 return response.read()
@@ -525,8 +744,9 @@ class ComfyM2MRenderAdapter(ComfyRenderAdapter):
         source_uri = request.parameters.get("source_audio_uri")
         if not source_uri:
             raise AdapterError("M2M render requires parameters.source_audio_uri")
-        if not source_uri.startswith(f"{self.base_url}/view?"):
-            raise AdapterError("M2M source_audio_uri must be on the configured ComfyUI instance")
+        is_local = Path(source_uri).is_file()
+        if not is_local and not source_uri.startswith(f"{self.base_url}/view?"):
+            raise AdapterError("M2M source_audio_uri must be a local file or a /view URI on the configured ComfyUI instance")
         source_bytes = self._fetch_bytes(source_uri)
         if not source_bytes:
             raise AdapterError("M2M source audio download returned no bytes")
@@ -598,7 +818,9 @@ class ComfyM2MRenderAdapter(ComfyRenderAdapter):
         if "14" in prompt:
             inputs = prompt["14"]["inputs"]
             inputs["tags"] = plan.tags
-            inputs["lyrics"] = plan.lyrics_or_prompt
+            # M2M also vocalizes the lyrics field; keep it empty for
+            # instrumental edits so the style caption tags drive the pass.
+            inputs["lyrics"] = "" if plan.instrumental_only else plan.lyrics_or_prompt
             inputs["lyrics_strength"] = float(parameters.get("lyrics_strength", self._DEFAULTS["lyrics_strength"]))
         if "52" in prompt:
             inputs = prompt["52"]["inputs"]
@@ -672,12 +894,19 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
         if gains is not None and not (isinstance(gains, list) and len(gains) == len(source_uris) and all(isinstance(g, (int, float)) for g in gains)):
             raise AdapterError("parameters.gains must be a numeric list matching source_audio_uris")
         mode = request.parameters.get("mode", "mix")
-        if mode not in ("mix", "concat"):
-            raise AdapterError("parameters.mode must be 'mix' or 'concat'")
+        if mode not in ("mix", "concat", "concat_crossfade"):
+            raise AdapterError("parameters.mode must be 'mix', 'concat', or 'concat_crossfade'")
+        crossfade_seconds = request.parameters.get("crossfade_seconds", 1.0)
+        if mode == "concat_crossfade" and (
+            not isinstance(crossfade_seconds, (int, float))
+            or isinstance(crossfade_seconds, bool)
+            or not 0.01 <= float(crossfade_seconds) <= 5.0
+        ):
+            raise AdapterError("parameters.crossfade_seconds must be between 0.01 and 5.0 seconds")
         payloads = [self._fetch_bytes(uri) for uri in source_uris]
         if not all(payloads):
             raise AdapterError("one or more mix source audio downloads returned no bytes")
-        mixed = self._mix(payloads, gains, mode=mode)
+        mixed = self._mix(payloads, gains, mode=mode, crossfade_seconds=float(crossfade_seconds))
         if not mixed:
             raise AdapterError("ffmpeg mix produced no output")
         uploaded = self._upload_output(mixed, _sanitize_filename_prefix(session.title or "songbird-mix"))
@@ -696,11 +925,11 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
                 request_id=None,
                 created_at=_now(),
                 source="comfy_mix_render_adapter",
-                metadata={"source_audio_uris": list(source_uris), "gains": list(gains) if gains else None, "mode": mode},
+                metadata={"source_audio_uris": list(source_uris), "gains": list(gains) if gains else None, "mode": mode, "crossfade_seconds": float(crossfade_seconds) if mode == "concat_crossfade" else None},
             )],
         )
 
-    def _mix(self, payloads: list[bytes], gains: list[float] | None, *, mode: str = "mix") -> bytes | None:
+    def _mix(self, payloads: list[bytes], gains: list[float] | None, *, mode: str = "mix", crossfade_seconds: float = 1.0) -> bytes | None:
         inputs: list[str] = []
         filter_parts: list[str] = []
         for index, payload in enumerate(payloads):
@@ -715,6 +944,13 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
         labels = "".join(f"[mix{i}]" for i in range(len(payloads)))
         if mode == "concat":
             filter_parts.append(f"{labels}concat=n={len(payloads)}:v=0:a=1[out]")
+        elif mode == "concat_crossfade":
+            previous = "mix0"
+            for index in range(1, len(payloads)):
+                output_label = f"xfade{index}"
+                filter_parts.append(f"[{previous}][mix{index}]acrossfade=d={crossfade_seconds:.4f}:c1=tri:c2=tri[{output_label}]")
+                previous = output_label
+            filter_parts.append(f"[{previous}]anull[out]")
         else:
             filter_parts.append(f"{labels}amix=inputs={len(payloads)}:duration=longest:dropout_transition=0[out]")
         output = Path("/tmp") / f"mix_out_{uuid4().hex[:8]}.mp3"
@@ -938,6 +1174,72 @@ class ComfyHealthAdapter:
             )
 
 
+class JsonHTTPHealthAdapter:
+    """Read-only JSON probe for a supporting HTTP service."""
+
+    def __init__(
+        self,
+        provider: str,
+        base_url: str,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        opener=urlopen,
+    ) -> None:
+        if not provider.strip() or not base_url.strip() or not path.strip():
+            raise ValueError("provider, base_url, and path must be non-empty strings")
+        self.provider = provider.strip()
+        self.base_url = base_url.rstrip("/")
+        self.path = "/" + path.lstrip("/")
+        self.method = method.upper()
+        self.payload = payload
+        self.headers = {"Accept": "application/json", **(headers or {})}
+        self.timeout = timeout
+        self._opener = opener
+
+    def check(self) -> ProviderHealthReport:
+        body = None
+        if self.payload is not None:
+            body = json.dumps(self.payload).encode("utf-8")
+            self.headers.setdefault("Content-Type", "application/json")
+        request = Request(
+            f"{self.base_url}{self.path}", data=body, headers=self.headers, method=self.method
+        )
+        checked_at = _now()
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_code = getattr(response, "status", 200)
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("service response must be a JSON object")
+            version = next(
+                (str(payload[key]) for key in ("version", "comfyui_version", "service_version") if payload.get(key)),
+                None,
+            )
+            return ProviderHealthReport(
+                provider=self.provider,
+                base_url=self.base_url,
+                reachable=True,
+                status_code=status_code,
+                version=version,
+                details={"endpoint": self.path, "response_keys": sorted(payload.keys())},
+                checked_at=checked_at,
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return ProviderHealthReport(
+                provider=self.provider,
+                base_url=self.base_url,
+                reachable=False,
+                status_code=getattr(exc, "code", None),
+                version=None,
+                details={"endpoint": self.path, "error": str(exc)},
+                checked_at=checked_at,
+            )
+
+
 class StaticCreativeAdapter:
     """Deterministic creative adapter for tests and local contract smoke runs."""
 
@@ -1046,3 +1348,185 @@ class AdapterRegistry:
             return self._render[name]
         except KeyError as exc:
             raise AdapterNotConfigured(f"render adapter {name!r} is not configured") from exc
+
+
+class LocalDemucsStemAdapter:
+    """HTDemucs source separation over a local source audio file.
+
+    Runs the isolated ``demucs`` binary (drums/bass/other/vocals) once per
+    source, caches the run per (source digest, fingerprint), and returns the
+    selected stem as a local ArtifactRecord with SHA-256 and per-stem duration.
+
+    Selection is driven by ``RenderRequest.parameters.stem`` so each stem can
+    be recorded as its own governed artifact session.
+    """
+
+    STEMS = ("drums", "bass", "other", "vocals")
+    _ALIASES = {"demucs_stem": "demucs_stem", "demucs": "demucs_stem", "htdemucs": "demucs_stem"}
+
+    def __init__(
+        self,
+        demucs_bin: str,
+        ffprobe: str = "/usr/bin/ffprobe",
+        *,
+        export_dir: str | Path | None = None,
+        timeout: float = 1800.0,
+        run_cmd=subprocess.run,
+    ) -> None:
+        self._demucs = demucs_bin
+        self._ffprobe = ffprobe
+        self._export_dir = Path(export_dir) if export_dir is not None else None
+        self.timeout = timeout
+        self._run_cmd = run_cmd
+        self._cache: dict[str, dict[str, Path]] = {}
+
+    def render(self, session: SongSession, request: RenderRequest) -> ArtifactRecord:
+        if session.status != SessionStatus.RENDER_APPROVED.value:
+            raise AdapterError("demucs stem render requires render_approved session")
+        if request.session_id != session.session_id or session.render_request != request:
+            raise AdapterError("render request identity or idempotency key mismatch")
+        if self._ALIASES.get(request.backend.lower().replace(" ", "_")) != "demucs_stem":
+            raise AdapterError("demucs stem render requires backend demucs_stem")
+        source = request.parameters.get("source_audio_uri")
+        if not source:
+            raise AdapterError("demucs stem render requires parameters.source_audio_uri")
+        stem = request.parameters.get("stem")
+        if stem not in self.STEMS:
+            raise AdapterError(f"parameters.stem must be one of {', '.join(self.STEMS)}")
+        stems = self._separate(source)
+        if stem not in stems:
+            raise AdapterError(f"demucs produced no {stem!r} stem")
+        local = self._export(stems[stem], session, request, stem)
+        return ArtifactRecord(
+            artifact_id=f"demucs-{stem}-{uuid4().hex}",
+            kind="audio",
+            uri=f"file://{local}",
+            mime_type="audio/mpeg",
+            checksum=sha256(local.read_bytes()).hexdigest(),
+            duration_seconds=self._probe_duration(local),
+            created_at=_now(),
+            provenance=[ProvenanceRecord(
+                provider="demucs",
+                model="htdemucs",
+                request_id=None,
+                created_at=_now(),
+                source="local_demucs_stem_adapter",
+                metadata={
+                    "local_path": str(local),
+                    "stem": stem,
+                    "source_audio_uri": source,
+                    "stems": sorted(stems),
+                },
+            )],
+        )
+
+    def _separate(self, source: str) -> dict[str, Path]:
+        if not Path(source).is_file():
+            raise AdapterError(f"demucs source file not found: {source}")
+        digest = sha256(Path(source).read_bytes()).hexdigest()
+        key = f"{digest[:16]}|{Path(source).stat().st_size}"
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        workdir = Path("/tmp") / f"demucs_{uuid4().hex[:8]}"
+        workdir.mkdir(parents=True, exist_ok=True)
+        args = [
+            self._demucs,
+            "-n", "htdemucs",
+            "--mp3",
+            "--out", str(workdir),
+            str(Path(source).resolve()),
+        ]
+        try:
+            result = self._run_cmd(args, capture_output=True, timeout=self.timeout)
+        except (OSError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            raise AdapterError(f"demucs run failed: {exc}") from exc
+        if result.returncode != 0:
+            raise AdapterError(f"demucs run failed (rc={result.returncode}): {result.stderr.decode('utf-8', 'replace')[-400:]}")
+        model_dir = workdir / "htdemucs" / (Path(source).stem)
+        stems: dict[str, Path] = {}
+        for stem_name in self.STEMS:
+            candidate = model_dir / f"{Path(source).stem}" / f"{stem_name}.mp3"
+            fallback = model_dir / f"{stem_name}.mp3"
+            path = candidate if candidate.is_file() else fallback if fallback.is_file() else None
+            if path is not None:
+                stems[stem_name] = path
+        self._cache[key] = stems
+        return stems
+
+    def _export(self, stem_path: Path, session: SongSession, request: RenderRequest, stem: str) -> Path:
+        if self._export_dir is None:
+            raise AdapterError("demucs export directory is not configured")
+        stem_path = Path(stem_path)
+        target = self._export_dir / f"{_sanitize_filename_prefix(session.title or 'stem')}_{stem}.mp3"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(stem_path.read_bytes())
+        return target
+
+    def _probe_duration(self, path: Path) -> float:
+        try:
+            result = self._run_cmd(
+                [self._ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, check=False, timeout=10,
+            )
+            value = float(result.stdout.decode("utf-8").strip())
+            if math.isfinite(value) and value > 0:
+                return value
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        return 0.0
+
+
+class LocalArtifactQAAdapter:
+    """Checksum + duration verification for a local file:// artifact."""
+
+    def __init__(
+        self,
+        ffprobe: str = "/usr/bin/ffprobe",
+        *,
+        run_cmd=subprocess.run,
+    ) -> None:
+        self._ffprobe = ffprobe
+        self._run_cmd = run_cmd
+
+    def evaluate(self, session: SongSession) -> ArtifactQAReport:
+        if session.artifact is None:
+            raise AdapterError("artifact QA requires a persisted artifact")
+        uri = session.artifact.uri
+        if not uri.startswith("file://"):
+            raise AdapterError("local artifact QA requires a file:// artifact URI")
+        path = Path(uri[len("file://"):])
+        if not path.is_file():
+            return ArtifactQAReport(False, False, False, ["artifact file missing"], _now())
+        digest = sha256(path.read_bytes()).hexdigest()
+        checksum_verified = session.artifact.checksum is None or session.artifact.checksum == digest
+        findings = [f"sha256={digest}"]
+        if not checksum_verified:
+            findings.append("artifact checksum mismatch")
+        duration = self._probe_duration(path)
+        requested_duration = session.render_request.duration_seconds if session.render_request else session.artifact.duration_seconds
+        submitted_duration = session.artifact.duration_seconds
+        duration_verified = (
+            duration is not None
+            and abs(duration - requested_duration) <= 0.5
+            and abs(submitted_duration - requested_duration) <= 0.5
+        )
+        if duration is None:
+            findings.append("duration probe unsupported")
+        elif not duration_verified:
+            findings.append(f"duration mismatch: actual={duration:.3f}s requested={requested_duration:.3f}s submitted={submitted_duration:.3f}s")
+        else:
+            findings.append(f"duration verified: actual={duration:.3f}s requested={requested_duration:.3f}s submitted={submitted_duration:.3f}s")
+        return ArtifactQAReport(checksum_verified and duration_verified, checksum_verified, duration_verified, findings, _now())
+
+    def _probe_duration(self, path: Path) -> float | None:
+        try:
+            result = self._run_cmd(
+                [self._ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, check=False, timeout=10,
+            )
+            return float(result.stdout.decode("utf-8").strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
