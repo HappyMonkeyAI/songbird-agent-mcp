@@ -8,3 +8,8 @@ __pycache__/
 *.db
 output/
 artifacts/
+input/*.mp3
+input/*.wav
+input/*.flac
+*.json
+$SONGBIRD_AGENT_DB

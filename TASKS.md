@@ -26,6 +26,8 @@
 ## Phase 3 — Songbird integration
 - [x] Implement a read-only ComfyUI capability/health adapter.
 - [x] Add explicit `check_provider_health` MCP tool with no-startup-network behavior.
+- [x] Add aggregate read-only supporting-service health tool for ComfyUI, LightRAG, Perplexica, and Ollama.
+- [x] Add read-only Genius metadata lookup and LightRAG lyric-context MCP tools.
 - [x] Map Songbird profile and workflow inputs into a side-effect-free render plan.
 - [x] Add a Songbird workflow adapter with dry-run mode.
 - [ ] Add opt-in LLM transport configuration without copying Songbird secrets.

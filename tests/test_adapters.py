@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 import pytest
@@ -11,9 +12,14 @@ from songbird_agent_mcp.adapters import (
     AdapterRegistry,
     ComfyArtifactQAAdapter,
     ComfyHealthAdapter,
+    JsonHTTPHealthAdapter,
+    LocalArtifactQAAdapter,
+    LocalDemucsStemAdapter,
     ComfyM2MRenderAdapter,
     ComfyMixRenderAdapter,
     ComfyRenderAdapter,
+    GeniusAPIAdapter,
+    LightRAGQueryAdapter,
     HealthAdapter,
     _sanitize_filename_prefix,
     OllamaAdapterError,
@@ -23,8 +29,9 @@ from songbird_agent_mcp.adapters import (
     StaticCreativeAdapter,
     StaticQAAdapter,
     StaticRenderAdapter,
+    SongbirdDryRunAdapter,
 )
-from songbird_agent_mcp.contracts import ArtifactRecord, QAReport, RenderRequest, SessionStatus
+from songbird_agent_mcp.contracts import ArtifactRecord, CreativeStage, QAReport, RenderRequest, SessionStatus, StageName
 from songbird_agent_mcp.service import SessionService
 from songbird_agent_mcp.session_store import SessionStore
 
@@ -262,6 +269,68 @@ def test_comfy_health_adapter_returns_unreachable_report_on_transport_failure():
     assert "connection refused" in report.details["error"]
 
 
+def test_json_http_health_adapter_posts_read_only_probe():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse(b'{"response":"context", "references": []}')
+
+    report = JsonHTTPHealthAdapter(
+        "lightrag", "http://rag:9621", "/query", method="POST",
+        payload={"only_need_context": True}, opener=opener,
+    ).check()
+    assert report.reachable is True
+    assert report.details["endpoint"] == "/query"
+    assert calls[0][0].full_url == "http://rag:9621/query"
+    assert json.loads(calls[0][0].data) == {"only_need_context": True}
+
+
+def test_genius_adapter_authenticates_searches_and_returns_safe_song_metadata():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(request)
+        if request.full_url.endswith("/oauth/token"):
+            return FakeResponse(b'{"access_token":"token-123"}')
+        return FakeResponse(json.dumps({"response": {"hits": [{"result": {
+            "id": 123, "title": "Neon Signal", "url": "https://genius.com/x",
+            "primary_artist": {"id": 9, "name": "Test Artist"},
+        }}]}}).encode())
+
+    results = GeniusAPIAdapter("client", "secret", opener=opener).search("neon signal", limit=3)
+    assert results == [{"id": 123, "title": "Neon Signal", "url": "https://genius.com/x", "artist": "Test Artist", "artist_id": 9, "album": None, "release_date": None, "lyrics_state": None}]
+    assert calls[0].full_url.endswith("/oauth/token")
+    assert calls[1].full_url.startswith("https://api.genius.com/search?q=neon+signal")
+    assert calls[1].get_header("Authorization") == "Bearer token-123"
+
+
+def test_genius_adapter_accepts_existing_access_token_without_oauth_call():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(request)
+        return FakeResponse(b'{"response":{"hits":[]}}')
+
+    GeniusAPIAdapter(access_token="existing-token", opener=opener).search("neon")
+    assert len(calls) == 1
+    assert calls[0].get_header("Authorization") == "Bearer existing-token"
+
+
+def test_lightrag_query_adapter_requests_context_only():
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(request)
+        return FakeResponse(b'{"response":"neon rain", "references":[{"file_path":"CYBERPUNK/a.txt"}]}')
+
+    result = LightRAGQueryAdapter("http://rag:9621", api_key="rag-key", opener=opener).query("neon")
+    assert result["context"] == "neon rain"
+    assert result["references"] == [{"file_path": "CYBERPUNK/a.txt"}]
+    assert json.loads(calls[0].data)["only_need_context"] is True
+    assert calls[0].get_header("X-api-key") == "rag-key"
+
+
 def test_comfy_render_adapter_submits_approved_workflow_and_returns_remote_artifact(tmp_path):
     service, store, session = make_session()
     session.status = SessionStatus.RENDER_APPROVED.value
@@ -277,14 +346,82 @@ def test_comfy_render_adapter_submits_approved_workflow_and_returns_remote_artif
         return FakeResponse(b'{"prompt_id":"prompt-123"}')
 
     def get_json(req, timeout):
+        if "/view?" in req.full_url:
+            return FakeResponse(b"MP3BYTES")
         return FakeResponse(b'{"prompt-123":{"outputs":{"35":{"audio":[{"filename":"song.mp3","subfolder":"audio","type":"output"}]}}}}')
 
-    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    export_dir = tmp_path / "exports"
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, output_dir=export_dir, timeout=5, post_json=post_json, get_json=get_json)
     artifact = adapter.render(session, request)
     assert artifact.uri == "http://comfy:8188/view?filename=song.mp3&subfolder=audio&type=output"
     assert artifact.mime_type == "audio/mpeg"
     assert artifact.provenance[0].request_id == "prompt-123"
     assert posts[0]["prompt"]["35"]["inputs"]["filename_prefix"] == "audio/Adapter Smoke"
+    exported = list(export_dir.glob("*.mp3"))
+    assert len(exported) == 1
+    assert exported[0].read_bytes() == b"MP3BYTES"
+    store.close()
+
+
+def test_comfy_render_minimax_instrumental_passes_empty_lyrics(tmp_path):
+    """Instrumental MiniMax renders must not feed the verbal prompt into the
+    lyrics field, or the model sings the instructions as vocals."""
+    service, store, session = make_session()
+    session.instrumental_only = True
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(session.session_id, "minimax_music", 180, "idem-instr-lyrics", "now", "operator")
+    session.render_request = request
+    (tmp_path / "audio_minimax_music_3.json").write_text(
+        '{"37:38":{"inputs":{"seed":0}},"37:13":{"inputs":{}},"37:9":{"inputs":{}},"35":{"inputs":{}}}',
+        encoding="utf-8",
+    )
+    posts = []
+
+    def post_json(req, timeout):
+        posts.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(b'{"prompt_id":"prompt-instr-lyrics"}')
+
+    def get_json(req, timeout):
+        return FakeResponse(b'{"prompt-instr-lyrics":{"outputs":{"35":{"audio":[{"filename":"song.mp3","subfolder":"audio","type":"output"}]}}}}')
+
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter.render(session, request)
+    submitted = posts[0]["prompt"]["37:13"]["inputs"]
+    assert submitted["lyrics"] == ""
+    assert json.loads(submitted["caption"])["Global Metadata"]["genre"] == "SYNTHWAVE"
+    store.close()
+
+
+def test_comfy_render_minimax_song_keeps_lyrics_field(tmp_path):
+    """A vocal song session keeps lyrics in the workflow lyrics field."""
+    service, store, session = make_session()  # instrumental_only defaults False
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(session.session_id, "minimax_music", 180, "idem-vocal-lyrics", "now", "operator")
+    session.render_request = request
+    session.stages = [CreativeStage(
+        name=StageName.LYRICS_OR_PROMPT.value,
+        status="draft",
+        revision=1,
+        content={"text": "[Chorus]\nTurn the signal on"},
+        updated_at="now",
+    )]
+    (tmp_path / "audio_minimax_music_3.json").write_text(
+        '{"37:38":{"inputs":{"seed":0}},"37:13":{"inputs":{}},"37:9":{"inputs":{}},"35":{"inputs":{}}}',
+        encoding="utf-8",
+    )
+    posts = []
+
+    def post_json(req, timeout):
+        posts.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(b'{"prompt_id":"prompt-vocal-lyrics"}')
+
+    def get_json(req, timeout):
+        return FakeResponse(b'{"prompt-vocal-lyrics":{"outputs":{"35":{"audio":[{"filename":"song.mp3","subfolder":"audio","type":"output"}]}}}}')
+
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter.render(session, request)
+    submitted = posts[0]["prompt"]["37:13"]["inputs"]
+    assert submitted["lyrics"] == "[Chorus]\nTurn the signal on"
     store.close()
 
 
@@ -345,6 +482,99 @@ def test_comfy_render_adapter_uses_session_seed_when_not_overridden(tmp_path):
     adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
     adapter.render(session, request)
     assert posts[0]["prompt"]["37:38"]["inputs"]["seed"] == 31337
+    store.close()
+
+
+def test_ace_step_plan_exposes_v2_pop_quality_defaults():
+    _, store, session = make_session()
+    session.genre = "POP"
+    plan = SongbirdDryRunAdapter().plan(session, "ace_step", 240, "pop-quality", 2026)
+    assert plan.duration_effective == 240
+    assert plan.parameters["default_steps"] == 16
+    assert plan.parameters["default_cfg"] == 1.4
+    assert plan.parameters["default_sampler"] == "dpmpp_2m"
+    assert plan.parameters["default_scheduler"] == "sgm_uniform"
+    assert plan.parameters["default_cfg_scale"] == 3.5
+    assert plan.parameters["generation_seed"] == 2026
+    store.close()
+
+
+def test_comfy_render_adapter_applies_v2_ace_settings_to_workflow(tmp_path):
+    service, store, session = make_session()
+    session.genre = "POP"
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id, "ace_step", 240, "idem-ace-v2", "now", "operator",
+        parameters={"seed": 2026},
+    )
+    session.render_request = request
+    (tmp_path / "audio_ace_step_1_5_checkpoint.json").write_text(
+        json.dumps({
+            "3": {"inputs": {"seed": 0, "steps": 50, "cfg": 4, "sampler_name": "euler", "scheduler": "sgm_uniform"}},
+            "7": {"inputs": {"text": ""}},
+            "94": {"inputs": {}},
+            "98": {"inputs": {"seconds": 120}},
+            "104": {"inputs": {"filename_prefix": "audio/old"}},
+        }),
+        encoding="utf-8",
+    )
+    posts = []
+
+    def post_json(req, timeout):
+        posts.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(b'{"prompt_id":"prompt-ace-v2"}')
+
+    def get_json(req, timeout):
+        return FakeResponse(b'{"prompt-ace-v2":{"outputs":{"104":{"audio":[{"filename":"song.mp3","subfolder":"audio","type":"output"}]}}}}')
+
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter.render(session, request)
+    prompt = posts[0]["prompt"]
+    assert prompt["3"]["inputs"] == {
+        "seed": 2026,
+        "steps": 16,
+        "cfg": 1.4,
+        "sampler_name": "dpmpp_2m",
+        "scheduler": "sgm_uniform",
+    }
+    assert prompt["94"]["inputs"]["cfg_scale"] == 3.5
+    assert prompt["98"]["inputs"]["seconds"] == 240
+    assert prompt["7"]["inputs"]["text"]
+    store.close()
+
+
+def test_comfy_render_adapter_ace_step_negative_prompt_override(tmp_path):
+    service, store, session = make_session()
+    session.genre = "POP"
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id, "ace_step", 16, "idem-ace-neg", "now", "operator",
+        parameters={"seed": 2026, "negative_prompt": "vocals, singing, voice, crowd, noise"},
+    )
+    session.render_request = request
+    (tmp_path / "audio_ace_step_1_5_checkpoint.json").write_text(
+        json.dumps({
+            "3": {"inputs": {"seed": 0, "steps": 50, "cfg": 4}},
+            "7": {"inputs": {"text": ""}},
+            "94": {"inputs": {}},
+            "98": {"inputs": {"seconds": 120}},
+            "104": {"inputs": {"filename_prefix": "audio/old"}},
+        }),
+        encoding="utf-8",
+    )
+    posts = []
+
+    def post_json(req, timeout):
+        posts.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(b'{"prompt_id":"prompt-ace-neg"}')
+
+    def get_json(req, timeout):
+        return FakeResponse(b'{"prompt-ace-neg":{"outputs":{"104":{"audio":[{"filename":"song.mp3","subfolder":"audio","type":"output"}]}}}}')
+
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter.render(session, request)
+    prompt = posts[0]["prompt"]
+    assert prompt["7"]["inputs"]["text"] == "vocals, singing, voice, crowd, noise"
     store.close()
 
 
@@ -428,6 +658,120 @@ def test_comfy_m2m_render_adapter_uploads_source_and_submits_m2m_workflow(tmp_pa
     assert prompt["64"]["inputs"]["audio"].startswith("m2m_source_")
     assert prompt["14"]["inputs"]["lyrics_strength"] == 0.99
     assert prompt["52"]["inputs"]["steps"] == 50
+    store.close()
+
+
+def test_comfy_m2m_render_adapter_accepts_local_source_file(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    session.instrumental_only = True
+    src = tmp_path / "AceLoopRez.mp3"
+    src.write_bytes(b"LOCALMP3BYTES")
+    request = RenderRequest(
+        session.session_id,
+        "ace_step_m2m",
+        51,
+        "idem-m2m-local",
+        "now",
+        "operator",
+        parameters={"source_audio_uri": str(src), "denoise": 0.3},
+    )
+    session.render_request = request
+    (tmp_path / "audio_ace_step_m2m_edit.json").write_text(
+        '{"14":{"inputs":{}},"52":{"inputs":{}},"64":{"inputs":{"audio":""}},"59":{"inputs":{}}}', encoding="utf-8"
+    )
+    posts = []
+    uploads = []
+
+    def get_json(req, timeout):
+        if "/history/" in req.full_url:
+            return FakeResponse(b'{"prompt-m2m-local":{"outputs":{"59":{"audio":[{"filename":"res.mp3","subfolder":"audio","type":"output"}]}}}}')
+        return FakeResponse(b"MP3BYTES")
+
+    def post_json(req, timeout):
+        if req.full_url.endswith("/upload/image"):
+            body = req.data
+            uploads.append(body)
+            return FakeResponse(b'{"name":"m2m_source_localhash.mp3","subfolder":"","type":"input"}')
+        posts.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(b'{"prompt_id":"prompt-m2m-local"}')
+
+    adapter = ComfyM2MRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter.render(session, request)
+    assert uploads and b"LOCALMP3BYTES" in uploads[0]
+    prompt = posts[0]["prompt"]
+    assert prompt["64"]["inputs"]["audio"].startswith("m2m_source_")
+    assert prompt["14"]["inputs"]["lyrics"] == ""  # instrumental_only -> empty lyrics
+    store.close()
+
+
+def test_local_demucs_stem_adapter_returns_selected_stem_artifact(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    session.instrumental_only = True
+    source = tmp_path / "track.mp3"
+    source.write_bytes(b"MP3SOURCEDATA")
+    export = tmp_path / "stems"
+
+    class FakeResult:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    runs = []
+
+    def fake_run(args, **kwargs):
+        runs.append(args)
+        if args[0].endswith("demucs"):
+            out_idx = args.index("--out")
+            model_dir = Path(args[out_idx + 1]) / "htdemucs" / "track"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            for stem in ("drums", "bass", "other", "vocals"):
+                (model_dir / f"{stem}.mp3").write_bytes(b"STEM" + stem.encode())
+            return FakeResult()
+        return type("R", (), {"returncode": 0, "stdout": b"16.0"})
+
+    request = RenderRequest(
+        session.session_id, "demucs_stem", 17, "idem-stem", "now", "operator",
+        parameters={"source_audio_uri": str(source), "stem": "drums"},
+    )
+    session.render_request = request
+    adapter = LocalDemucsStemAdapter("demucs", export_dir=export, run_cmd=fake_run)
+    artifact = adapter.render(session, request)
+    assert artifact.kind == "audio"
+    assert artifact.uri.startswith("file://")
+    assert artifact.provenance[0].model == "htdemucs"
+    assert artifact.provenance[0].metadata["stem"] == "drums"
+    assert artifact.checksum
+    store.close()
+
+
+def test_local_artifact_qa_adapter_verifies_checksum_and_duration(tmp_path):
+    from songbird_agent_mcp.adapters import LocalArtifactQAAdapter
+    from songbird_agent_mcp.contracts import ArtifactRecord, ProvenanceRecord
+
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    session.instrumental_only = True
+    request = RenderRequest(session.session_id, "demucs_stem", 16, "idem-stem-qa", "now", "operator")
+    session.render_request = request
+    stem = tmp_path / "drums.mp3"
+    stem.write_bytes(b"STEMDATA")
+
+    def fake_run(args, **kwargs):
+        assert args[0] == "/usr/bin/ffprobe"
+        return type("R", (), {"returncode": 0, "stdout": b"16.0"})
+
+    session.status = SessionStatus.RENDERING.value
+    session.artifact = ArtifactRecord(
+        artifact_id="demucs-drums", kind="audio", uri=f"file://{stem}", mime_type="audio/mpeg",
+        checksum=sha256(b"STEMDATA").hexdigest(), duration_seconds=16.0, created_at="now",
+        provenance=[ProvenanceRecord(provider="demucs", model="htdemucs", request_id=None, created_at="now", source="test", metadata={})],
+    )
+    report = LocalArtifactQAAdapter(run_cmd=fake_run).evaluate(session)
+    assert report.passed is True
+    assert report.checksum_verified is True
+    assert report.duration_verified is True
     store.close()
 
 
@@ -552,6 +896,118 @@ def test_comfy_mix_render_adapter_rejects_gain_length_mismatch(tmp_path):
     adapter = ComfyMixRenderAdapter("http://comfy:8188", tmp_path, timeout=5)
     with pytest.raises(AdapterError, match="gains"):
         adapter.render(session, request)
+    store.close()
+
+
+def test_comfy_mix_render_adapter_concat_mode_uses_concat_filter(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id,
+        "ffmpeg_mix",
+        300,
+        "idem-concat",
+        "now",
+        "operator",
+        parameters={
+            "source_audio_uris": [
+                "http://comfy:8188/view?filename=a.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=b.mp3&subfolder=audio&type=output",
+            ],
+            "mode": "concat",
+        },
+    )
+    session.render_request = request
+    captured = []
+
+    def get_json(req, timeout):
+        return FakeResponse(b"MP3BYTES")
+
+    def post_json(req, timeout):
+        return FakeResponse(b'{"name":"MIX_concat_0000.mp3","subfolder":"","type":"output"}')
+
+    def run_cmd(args, capture_output=True, timeout=0):
+        captured.append(args)
+        Path(args[-1]).write_bytes(b"CONCATBYTES")
+        return FakeCompletedProcess(0)
+
+    adapter = ComfyMixRenderAdapter(
+        "http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json, run_cmd=run_cmd
+    )
+    artifact = adapter.render(session, request)
+    filter_idx = captured[0].index("-filter_complex")
+    filter_complex = captured[0][filter_idx + 1]
+    assert "concat=n=2:v=0:a=1[out]" in filter_complex
+    assert "amix" not in filter_complex
+    assert artifact.provenance[0].metadata["mode"] == "concat"
+    assert artifact.uri == "http://comfy:8188/view?filename=MIX_concat_0000.mp3&subfolder=&type=output"
+    store.close()
+
+
+def test_comfy_mix_render_adapter_rejects_invalid_mode(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id, "ffmpeg_mix", 161, "idem-mode", "now", "operator",
+        parameters={
+            "source_audio_uris": [
+                "http://comfy:8188/view?filename=a.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=b.mp3&subfolder=audio&type=output",
+            ],
+            "mode": "fade",
+        },
+    )
+    session.render_request = request
+    adapter = ComfyMixRenderAdapter("http://comfy:8188", tmp_path, timeout=5)
+    with pytest.raises(AdapterError, match="mode"):
+        adapter.render(session, request)
+    store.close()
+
+
+def test_comfy_mix_render_adapter_concat_crossfade_mode_uses_chained_crossfades(tmp_path):
+    service, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(
+        session.session_id,
+        "ffmpeg_mix",
+        300,
+        "idem-crossfade",
+        "now",
+        "operator",
+        parameters={
+            "source_audio_uris": [
+                "http://comfy:8188/view?filename=a.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=b.mp3&subfolder=audio&type=output",
+                "http://comfy:8188/view?filename=c.mp3&subfolder=audio&type=output",
+            ],
+            "mode": "concat_crossfade",
+            "crossfade_seconds": 1.25,
+        },
+    )
+    session.render_request = request
+    captured = []
+
+    def get_json(req, timeout):
+        return FakeResponse(b"MP3BYTES")
+
+    def post_json(req, timeout):
+        return FakeResponse(b'{"name":"MIX_crossfade_0000.mp3","subfolder":"","type":"output"}')
+
+    def run_cmd(args, capture_output=True, timeout=0):
+        captured.append(args)
+        Path(args[-1]).write_bytes(b"CROSSFADEBYTES")
+        return FakeCompletedProcess(0)
+
+    adapter = ComfyMixRenderAdapter(
+        "http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json, run_cmd=run_cmd
+    )
+    artifact = adapter.render(session, request)
+    filter_idx = captured[0].index("-filter_complex")
+    filter_complex = captured[0][filter_idx + 1]
+    assert filter_complex.count("acrossfade=d=1.2500") == 2
+    assert "concat=n=3" not in filter_complex
+    assert artifact.provenance[0].metadata["mode"] == "concat_crossfade"
+    assert artifact.provenance[0].metadata["crossfade_seconds"] == 1.25
     store.close()
 
 

@@ -17,6 +17,10 @@ from songbird_agent_mcp.adapters import (
     ComfyM2MRenderAdapter,
     ComfyMixRenderAdapter,
     ComfyRenderAdapter,
+    GeniusAPIAdapter,
+    JsonHTTPHealthAdapter,
+    LightRAGQueryAdapter,
+    LocalDemucsStemAdapter,
     OllamaMusicDirectionAdapter,
     OpenAIMusicDirectionAdapter,
     SongbirdDryRunAdapter,
@@ -37,6 +41,9 @@ _store = SessionStore(os.environ.get("SONGBIRD_AGENT_DB", ":memory:"))
 _service = SessionService(_store)
 _adapters = AdapterRegistry()
 _health_adapters: dict[str, ComfyHealthAdapter] = {}
+_supporting_health_adapters: dict[str, JsonHTTPHealthAdapter] = {}
+_genius_adapter: GeniusAPIAdapter | None = None
+_lightrag_query_adapter: LightRAGQueryAdapter | None = None
 _artifact_qa_adapters: dict[str, ComfyArtifactQAAdapter] = {}
 _dry_run_adapter = SongbirdDryRunAdapter()
 if os.environ.get("SONGBIRD_OLLAMA_MODEL") and os.environ.get("OLLAMA_BASE_URL"):
@@ -59,6 +66,44 @@ if os.environ.get("SONGBIRD_LLM_MODEL") and os.environ.get("SONGBIRD_LLM_BASE_UR
 if os.environ.get("COMFYUI_URL"):
     _health_adapters["comfyui"] = ComfyHealthAdapter(os.environ["COMFYUI_URL"])
     _artifact_qa_adapters["comfyui"] = ComfyArtifactQAAdapter(os.environ["COMFYUI_URL"])
+if os.environ.get("LIGHTRAG_URL"):
+    _lightrag_query_adapter = LightRAGQueryAdapter(
+        os.environ["LIGHTRAG_URL"], api_key=os.environ.get("LIGHTRAG_API_KEY")
+    )
+    _supporting_health_adapters["lightrag"] = JsonHTTPHealthAdapter(
+        "lightrag", os.environ["LIGHTRAG_URL"], "/query", method="POST",
+        payload={"query": "__songbird_healthcheck__", "mode": "local", "only_need_context": True, "response_type": "string"},
+        headers={"X-API-Key": os.environ.get("LIGHTRAG_API_KEY", "")},
+    )
+if os.environ.get("GENIUS_ACCESS_TOKEN") or (os.environ.get("GENIUS_CLIENTID") and os.environ.get("GENIUS_CLIENTSECRET")):
+    _genius_adapter = GeniusAPIAdapter(
+        os.environ.get("GENIUS_CLIENTID", ""),
+        os.environ.get("GENIUS_CLIENTSECRET", ""),
+        access_token=os.environ.get("GENIUS_ACCESS_TOKEN"),
+    )
+if os.environ.get("PERPLEXICA_URL"):
+    _supporting_health_adapters["perplexica"] = JsonHTTPHealthAdapter(
+        "perplexica", os.environ["PERPLEXICA_URL"], "/api/search", method="POST",
+        payload={
+            "chatModel": {"provider": "ollama", "model": os.environ.get("PERPLEXICA_CHAT_MODEL", "")},
+            "embeddingModel": {"provider": "ollama", "model": os.environ.get("PERPLEXICA_EMBEDDING_MODEL", "nomic-embed-text:latest")},
+            "optimizationMode": os.environ.get("PERPLEXICA_OPTIMIZATION_MODE", "speed"),
+            "focusMode": "webSearch", "query": "__songbird_healthcheck__", "history": [],
+        },
+    )
+if os.environ.get("OLLAMA_BASE_URL"):
+    _ollama_health_url = os.environ["OLLAMA_BASE_URL"].rstrip("/")
+    if _ollama_health_url.endswith("/v1"):
+        _ollama_api_key = os.environ.get(
+            "SONGBIRD_LLM_API_KEY",
+            os.environ.get("LLM_API_KEY", os.environ.get("OLLAMA_KEY", "")),
+        )
+        _supporting_health_adapters["ollama"] = JsonHTTPHealthAdapter(
+            "ollama", _ollama_health_url, "/models",
+            headers={"Authorization": f"Bearer {_ollama_api_key}"} if _ollama_api_key else {},
+        )
+    else:
+        _supporting_health_adapters["ollama"] = JsonHTTPHealthAdapter("ollama", _ollama_health_url, "/api/tags")
 if os.environ.get("COMFYUI_URL") and os.environ.get("SONGBIRD_WORKFLOW_ROOT"):
     _render_timeout = float(os.environ.get("SONGBIRD_RENDER_TIMEOUT", "120"))
     _adapters.register_render(
@@ -66,6 +111,7 @@ if os.environ.get("COMFYUI_URL") and os.environ.get("SONGBIRD_WORKFLOW_ROOT"):
         ComfyRenderAdapter(
             os.environ["COMFYUI_URL"],
             os.environ["SONGBIRD_WORKFLOW_ROOT"],
+            output_dir=os.environ.get("SONGBIRD_OUTPUT_DIR"),
             timeout=_render_timeout,
         ),
     )
@@ -83,6 +129,17 @@ if os.environ.get("COMFYUI_URL") and os.environ.get("SONGBIRD_WORKFLOW_ROOT"):
             os.environ["COMFYUI_URL"],
             os.environ["SONGBIRD_WORKFLOW_ROOT"],
             timeout=max(_render_timeout, 300.0),
+        ),
+    )
+if os.environ.get("SONGBIRD_DEMUCS_BIN"):
+    _demucs_timeout = float(os.environ.get("SONGBIRD_DEMUCS_TIMEOUT", "1800.0"))
+    _adapters.register_render(
+        "demucs_stem",
+        LocalDemucsStemAdapter(
+            demucs_bin=os.environ["SONGBIRD_DEMUCS_BIN"],
+            ffprobe=os.environ.get("SONGBIRD_FFPROBE", "/usr/bin/ffprobe"),
+            export_dir=os.environ.get("SONGBIRD_DEMUCS_EXPORT_DIR"),
+            timeout=_demucs_timeout,
         ),
     )
 
@@ -303,6 +360,61 @@ def check_provider_health(provider: str = "comfyui") -> dict[str, Any]:
     if adapter is None:
         return {"error": "provider_not_configured", "provider": provider}
     return adapter.check().to_dict()
+
+
+@mcp.tool()
+def check_supporting_services() -> dict[str, Any]:
+    """Run read-only contract probes for configured Songbird dependencies."""
+    configured = {"comfyui": _health_adapters.get("comfyui"), **_supporting_health_adapters}
+    services: list[dict[str, Any]] = []
+    for name in ("comfyui", "lightrag", "perplexica", "ollama"):
+        adapter = configured.get(name)
+        if adapter is None:
+            services.append({"provider": name, "configured": False, "status": "not_configured"})
+            continue
+        report = adapter.check().to_dict()
+        report["configured"] = True
+        report["status"] = "ready" if report["reachable"] else "unavailable"
+        services.append(report)
+    configured_services = [item for item in services if item["configured"]]
+    return {
+        "status": "ready" if configured_services and all(item["status"] == "ready" for item in configured_services) else "degraded",
+        "services": services,
+        "checked_at": _now(),
+    }
+
+
+@mcp.tool()
+def search_genius_songs(query: str, limit: int = 5) -> dict[str, Any]:
+    """Search Genius for song metadata and lyric availability, without lyric text."""
+    if _genius_adapter is None:
+        return {"error": "provider_not_configured", "provider": "genius"}
+    try:
+        return {"provider": "genius", "query": query, "results": _genius_adapter.search(query, limit=limit)}
+    except (AdapterError, ValueError) as exc:
+        return {"error": "genius_search_failed", "provider": "genius", "message": str(exc)}
+
+
+@mcp.tool()
+def get_genius_song(song_id: int) -> dict[str, Any]:
+    """Fetch Genius metadata for one song, without lyric text."""
+    if _genius_adapter is None:
+        return {"error": "provider_not_configured", "provider": "genius"}
+    try:
+        return {"provider": "genius", "song": _genius_adapter.get_song(song_id)}
+    except (AdapterError, ValueError) as exc:
+        return {"error": "genius_song_failed", "provider": "genius", "message": str(exc)}
+
+
+@mcp.tool()
+def search_lyric_context(query: str, mode: str = "mix") -> dict[str, Any]:
+    """Retrieve context and references from the configured LightRAG lyric corpus."""
+    if _lightrag_query_adapter is None:
+        return {"error": "provider_not_configured", "provider": "lightrag"}
+    try:
+        return {"provider": "lightrag", "query": query, **_lightrag_query_adapter.query(query, mode=mode)}
+    except (AdapterError, ValueError) as exc:
+        return {"error": "lightrag_query_failed", "provider": "lightrag", "message": str(exc)}
 
 
 @mcp.tool()
