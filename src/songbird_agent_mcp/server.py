@@ -20,6 +20,7 @@ from songbird_agent_mcp.adapters import (
     GeniusAPIAdapter,
     JsonHTTPHealthAdapter,
     LightRAGQueryAdapter,
+    LocalDemucsStemAdapter,
     OllamaMusicDirectionAdapter,
     OpenAIMusicDirectionAdapter,
     SongbirdDryRunAdapter,
@@ -128,6 +129,17 @@ if os.environ.get("COMFYUI_URL") and os.environ.get("SONGBIRD_WORKFLOW_ROOT"):
             os.environ["COMFYUI_URL"],
             os.environ["SONGBIRD_WORKFLOW_ROOT"],
             timeout=max(_render_timeout, 300.0),
+        ),
+    )
+if os.environ.get("SONGBIRD_DEMUCS_BIN"):
+    _demucs_timeout = float(os.environ.get("SONGBIRD_DEMUCS_TIMEOUT", "1800.0"))
+    _adapters.register_render(
+        "demucs_stem",
+        LocalDemucsStemAdapter(
+            demucs_bin=os.environ["SONGBIRD_DEMUCS_BIN"],
+            ffprobe=os.environ.get("SONGBIRD_FFPROBE", "/usr/bin/ffprobe"),
+            export_dir=os.environ.get("SONGBIRD_DEMUCS_EXPORT_DIR"),
+            timeout=_demucs_timeout,
         ),
     )
 

@@ -18,11 +18,40 @@ uv run fastmcp list --command 'uv run songbird-agent-mcp' --json
 
 Set `SONGBIRD_AGENT_DB` to a SQLite path for persistence across server restarts. It defaults to `:memory:` for isolated local development.
 
+To verify your environment setup before running the server, use the verification script:
+
+```bash
+./verify-setup.sh
+```
+
 Run the stdio server:
 
 ```bash
 uv run songbird-agent-mcp
 ```
+
+## ComfyUI Integration Prerequisites
+
+ComfyUI rendering is opt-in when both `COMFYUI_URL` and `SONGBIRD_WORKFLOW_ROOT` are configured. To use ComfyUI render adapters (MiniMax Music 3, ACE-Step M2M style transfer, FFmpeg layer mixing), you must:
+
+1. Install and run ComfyUI, accessible via the `COMFYUI_URL` environment variable (e.g., `http://localhost:8188`).
+2. Install the required custom nodes for the workflows (MiniMax Music 3 nodes, ACE-Step nodes, etc.).
+3. Place the workflow JSON files in the directory specified by `SONGBIRD_WORKFLOW_ROOT`:
+   - `audio_ace_step_1_5_checkpoint.json` (for ACE-Step 1.5 renders)
+   - `audio_ace_step_m2m_edit.json` (for ACE-Step music-to-music style transfer)
+   - `audio_minimax_music_3.json` (for MiniMax Music 3 renders)
+4. Download and place the required models in the correct ComfyUI directories:
+   - For ACE-Step: `ace_step_1.5_turbo_aio.safetensors` (checkpoint), along with required text encoders and VAE
+   - For MiniMax Music 3: `minimax_music3_dit_fp16.safetensors`, `minimax_music3_text_encoder_pruned_int8_convrot.safetensors`, and `minimax_music3_dav.safetensors`
+
+## Demucs Stem Separation Prerequisites
+
+The `demucs_stem` render adapter enables HTDemucs source separation (drums/bass/other/vocals) over a local source audio file. To use this feature:
+
+1. Ensure the `demucs` binary is installed and accessible.
+2. Set the `SONGBIRD_DEMUCS_BIN` environment variable to the path of the `demucs` binary.
+3. Ensure the `htdemucs` model is available to the demucs installation.
+4. Ensure `ffprobe` is installed for duration probing (typically available via the `ffmpeg` package).
 
 ## Planned MCP surface
 

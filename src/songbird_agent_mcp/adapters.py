@@ -417,6 +417,9 @@ class SongbirdDryRunAdapter:
         "minimax_music3": "minimax_music",
         "music3": "minimax_music",
         "music_3": "minimax_music",
+        "demucs": "demucs_stem",
+        "htdemucs": "demucs_stem",
+        "demucs_stem": "demucs_stem",
     }
     _PROFILES = {
         "ace_step": {
@@ -460,6 +463,13 @@ class SongbirdDryRunAdapter:
             "default_sampler": "euler",
             "default_scheduler": "simple",
             "default_top_k": 50,
+        },
+        "demucs_stem": {
+            "label": "HTDemucs Stem Separation",
+            "kind": "demucs_stem",
+            "workflow": "local_demucs_stem",
+            "supports_negative_text": False,
+            "stems": ("drums", "bass", "other", "vocals"),
         },
     }
 
@@ -521,6 +531,8 @@ class SongbirdDryRunAdapter:
             parameters.update({key: profile[key] for key in ("default_steps", "default_cfg", "default_cfg_scale", "default_sampler", "default_scheduler", "default_top_k")})
             parameters["generation_mode"] = "native_long_form" if duration <= profile["max_duration_cap"] else "segmented_fallback_required"
             parameters["structured_caption"] = self._minimax_caption(session, direction)
+        elif profile_id == "demucs_stem":
+            parameters["stems"] = profile.get("stems", ("drums", "bass", "other", "vocals"))
         if generation_seed is not None:
             parameters["generation_seed"] = generation_seed
         return RenderPlan(
