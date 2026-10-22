@@ -9,6 +9,7 @@ import json
 import math
 import re
 import subprocess
+import tempfile
 import time
 from typing import Any, Protocol, runtime_checkable
 from pathlib import Path
@@ -163,6 +164,18 @@ class LightRAGQueryAdapter:
         context = payload.get("response") or payload.get("output") or payload.get("context") or ""
         references = payload.get("references") or payload.get("ref_list") or []
         return {"context": context if isinstance(context, str) else str(context), "references": references if isinstance(references, list) else [], "mode": mode}
+
+
+def _checksum_findings(recorded: str | None, digest: str) -> tuple[bool, list[str]]:
+    """Compare a render-time checksum with downloaded bytes; a missing checksum fails closed."""
+    findings = [f"sha256={digest}"]
+    if recorded is None:
+        findings.append("no render-time checksum recorded; integrity cannot be verified")
+        return False, findings
+    if recorded != digest:
+        findings.append("artifact checksum mismatch")
+        return False, findings
+    return True, findings
 
 
 def _read_json_response(response: Any) -> dict[str, Any]:
@@ -394,6 +407,39 @@ def _sanitize_filename_prefix(value: str) -> str:
     return cleaned or "songbird"
 
 
+def _resolve_source_path(candidate: str, root: Path | None) -> Path:
+    """Resolve a model-supplied local source path, confined to an operator-configured root.
+
+    Render parameters are agent-controlled, so an unconfined path would let a render
+    read (and upload to a remote provider) any file the server process can access.
+    """
+    if root is None:
+        raise AdapterError("local source audio is disabled; configure SONGBIRD_SOURCE_AUDIO_ROOT")
+    try:
+        path = Path(candidate).resolve()
+    except (OSError, ValueError) as exc:
+        raise AdapterError("source audio path is invalid") from exc
+    if not path.is_relative_to(Path(root).resolve()):
+        raise AdapterError("source audio path is outside the allowed source root")
+    if not path.is_file():
+        raise AdapterError("source audio file not found under the allowed source root")
+    return path
+
+
+def _open_json(opener: Any, request: Request, timeout: float, context: str) -> dict[str, Any]:
+    """Call an HTTP opener and decode a JSON object, mapping transport failures to AdapterError."""
+    try:
+        response = opener(request, timeout=timeout)
+        if hasattr(response, "__enter__"):
+            with response as opened:
+                return _read_json_response(opened)
+        return _read_json_response(response)
+    except AdapterError:
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError, TypeError, ValueError) as exc:
+        raise AdapterError(f"{context} failed: {exc}") from exc
+
+
 class SongbirdDryRunAdapter:
     """Map Songbird-compatible session inputs into a side-effect-free render plan."""
 
@@ -502,9 +548,9 @@ class SongbirdDryRunAdapter:
         if not filename_prefix or "/" in filename_prefix or "\\" in filename_prefix:
             raise ValueError("filename_prefix must be a non-empty filename-safe value")
         profile = self._PROFILES[profile_id]
-        direction = next((stage.content for stage in session.stages if stage.name == StageName.MUSICAL_DIRECTION.value), {})
+        direction = next((stage.content for stage in reversed(session.stages) if stage.name == StageName.MUSICAL_DIRECTION.value), {})
         prompt_name = StageName.INSTRUMENTAL_PROMPT.value if session.instrumental_only else StageName.LYRICS_OR_PROMPT.value
-        prompt = next((stage.content for stage in session.stages if stage.name == prompt_name), {})
+        prompt = next((stage.content for stage in reversed(session.stages) if stage.name == prompt_name), {})
         tags = str(direction.get("tags", ""))
         lyrics_or_prompt = str(prompt.get("text", prompt.get("lyrics", prompt.get("prompt", ""))))
         effective_duration = min(duration, int(profile.get("max_duration_cap", 300)))
@@ -556,12 +602,15 @@ class SongbirdDryRunAdapter:
 class ComfyRenderAdapter:
     """Opt-in ComfyUI render adapter with optional in-process artifact export."""
 
+    PROFILES = ("ace_step", "minimax_music")
+
     def __init__(
         self,
         base_url: str,
         workflow_root: str | Path,
         *,
         output_dir: str | Path | None = None,
+        source_root: str | Path | None = None,
         timeout: float = 120.0,
         post_json=urlopen,
         get_json=urlopen,
@@ -572,6 +621,7 @@ class ComfyRenderAdapter:
         self.base_url = base_url.rstrip("/")
         self.workflow_root = Path(workflow_root)
         self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.source_root = Path(source_root) if source_root is not None else None
         self.timeout = timeout
         self._post_json = post_json
         self._get_json = get_json
@@ -590,6 +640,8 @@ class ComfyRenderAdapter:
             _sanitize_filename_prefix(session.title or "songbird"),
             generation_seed=request.parameters.get("seed", session.generation_seed),
         )
+        if plan.profile_id not in self.PROFILES:
+            raise AdapterError(f"ComfyUI render does not handle backend {request.backend!r}; use its dedicated adapter")
         if plan.parameters.get("supports_negative_text") and request.parameters.get("negative_prompt"):
             plan.parameters["negative_prompt"] = request.parameters["negative_prompt"]
         workflow_path = self.workflow_root / plan.workflow
@@ -598,41 +650,54 @@ class ComfyRenderAdapter:
         except (OSError, json.JSONDecodeError) as exc:
             raise AdapterError(f"workflow template unavailable: {workflow_path}") from exc
         self._apply_plan(prompt, plan)
-        response = self._post_json(
-            Request(f"{self.base_url}/prompt", data=json.dumps({"prompt": prompt, "client_id": session.session_id}).encode(), headers={"Content-Type": "application/json"}, method="POST"),
-            timeout=self.timeout,
-        )
-        payload = _read_json_response(response)
-        prompt_id = payload.get("prompt_id")
-        if not prompt_id:
-            raise AdapterError("ComfyUI response did not include prompt_id")
+        prompt_id = self._submit_prompt(prompt, session.session_id)
         history = self._wait_for_history(prompt_id)
         file_info = self._extract_file(history, plan.profile_id)
-        local_path = self._export_local_artifact(file_info, plan.filename_prefix, prompt_id)
-        query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
+        uri = self._view_uri(file_info)
+        data = self._fetch_artifact(uri)
+        local_path = self._export_local_artifact(data, file_info, plan.filename_prefix, prompt_id)
         extension = str(file_info.get("filename", "")).lower().rsplit(".", 1)[-1]
         mime_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac"}.get(extension, "audio/octet-stream")
         return ArtifactRecord(
             artifact_id=f"comfy-{prompt_id}",
             kind="audio",
-            uri=f"{self.base_url}/view?{query}",
+            uri=uri,
             mime_type=mime_type,
-            checksum=None,
+            checksum=sha256(data).hexdigest(),
             duration_seconds=request.duration_seconds,
             created_at=_now(),
             provenance=[ProvenanceRecord(provider="comfyui", model=plan.profile_id, request_id=prompt_id, created_at=_now(), source="comfy_render_adapter", metadata={"local_path": str(local_path) if local_path else None})],
         )
 
-    def _export_local_artifact(self, file_info: dict[str, Any], filename_prefix: str, prompt_id: str) -> Path | None:
+    def _submit_prompt(self, prompt: dict[str, Any], client_id: str) -> str:
+        payload = _open_json(
+            self._post_json,
+            Request(f"{self.base_url}/prompt", data=json.dumps({"prompt": prompt, "client_id": client_id}).encode(), headers={"Content-Type": "application/json"}, method="POST"),
+            self.timeout,
+            "ComfyUI prompt submission",
+        )
+        prompt_id = payload.get("prompt_id")
+        if not prompt_id:
+            raise AdapterError("ComfyUI response did not include prompt_id")
+        return str(prompt_id)
+
+    def _view_uri(self, file_info: dict[str, Any]) -> str:
+        query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
+        return f"{self.base_url}/view?{query}"
+
+    def _fetch_artifact(self, uri: str) -> bytes:
+        """Download the rendered bytes so the artifact carries a render-time checksum."""
+        data = self._fetch_bytes(uri)
+        if not data:
+            raise AdapterError("ComfyUI artifact download returned no bytes")
+        return data
+
+    def _export_local_artifact(self, data: bytes, file_info: dict[str, Any], filename_prefix: str, prompt_id: str) -> Path | None:
         if self.output_dir is None:
             return None
         suffix = Path(str(file_info.get("filename", "song.mp3"))).suffix.lower() or ".mp3"
         target = self.output_dir / f"{_sanitize_filename_prefix(filename_prefix)}_{prompt_id}{suffix}"
         target.parent.mkdir(parents=True, exist_ok=True)
-        query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
-        data = self._fetch_bytes(f"{self.base_url}/view?{query}")
-        if not data:
-            raise AdapterError("ComfyUI artifact export returned no bytes")
         target.write_bytes(data)
         return target
 
@@ -685,12 +750,22 @@ class ComfyRenderAdapter:
                 prompt["104"]["inputs"]["filename_prefix"] = f"audio/{plan.filename_prefix}"
 
     def _wait_for_history(self, prompt_id: str) -> dict[str, Any]:
+        # Bound total wall-clock time, not just the attempt count: each poll's own
+        # timeout is clipped to whatever remains of the overall budget.
         attempts = max(1, math.ceil(self.timeout / 5) + 1)
+        deadline = time.monotonic() + self.timeout
         for _ in range(attempts):
-            response = self._get_json(Request(f"{self.base_url}/history/{prompt_id}", method="GET"), timeout=self.timeout)
-            history = _read_json_response(response)
+            remaining = max(1.0, deadline - time.monotonic())
+            history = _open_json(
+                self._get_json,
+                Request(f"{self.base_url}/history/{prompt_id}", method="GET"),
+                min(self.timeout, remaining),
+                "ComfyUI history poll",
+            )
             if prompt_id in history:
                 return history[prompt_id]
+            if time.monotonic() >= deadline:
+                break
             self._sleep(5)
         raise AdapterError(f"ComfyUI history timeout for prompt {prompt_id}")
 
@@ -706,13 +781,7 @@ class ComfyRenderAdapter:
         raise AdapterError("ComfyUI history did not contain an audio file")
 
     def _fetch_bytes(self, uri: str) -> bytes:
-        if not uri.startswith(("http://", "https://")):
-            local = Path(uri)
-            if local.is_file():
-                try:
-                    return local.read_bytes()
-                except OSError:
-                    return b""
+        if not uri.startswith(f"{self.base_url}/"):
             return b""
         try:
             with self._get_json(Request(uri, method="GET"), timeout=self.timeout) as response:
@@ -754,12 +823,15 @@ class ComfyM2MRenderAdapter(ComfyRenderAdapter):
             generation_seed=request.parameters.get("seed", session.generation_seed),
         )
         source_uri = request.parameters.get("source_audio_uri")
-        if not source_uri:
+        if not source_uri or not isinstance(source_uri, str):
             raise AdapterError("M2M render requires parameters.source_audio_uri")
-        is_local = Path(source_uri).is_file()
-        if not is_local and not source_uri.startswith(f"{self.base_url}/view?"):
-            raise AdapterError("M2M source_audio_uri must be a local file or a /view URI on the configured ComfyUI instance")
-        source_bytes = self._fetch_bytes(source_uri)
+        if source_uri.startswith(f"{self.base_url}/view?"):
+            source_bytes = self._fetch_bytes(source_uri)
+        else:
+            try:
+                source_bytes = _resolve_source_path(source_uri, self.source_root).read_bytes()
+            except OSError as exc:
+                raise AdapterError(f"M2M source audio could not be read: {exc}") from exc
         if not source_bytes:
             raise AdapterError("M2M source audio download returned no bytes")
         input_filename = self._upload_input(source_bytes)
@@ -772,23 +844,17 @@ class ComfyM2MRenderAdapter(ComfyRenderAdapter):
         if "seed" not in parameters and session.generation_seed is not None:
             parameters["seed"] = session.generation_seed
         self._apply_m2m(prompt, plan, parameters, input_filename)
-        response = self._post_json(
-            Request(f"{self.base_url}/prompt", data=json.dumps({"prompt": prompt, "client_id": session.session_id}).encode(), headers={"Content-Type": "application/json"}, method="POST"),
-            timeout=self.timeout,
-        )
-        payload = _read_json_response(response)
-        prompt_id = payload.get("prompt_id")
-        if not prompt_id:
-            raise AdapterError("ComfyUI response did not include prompt_id")
+        prompt_id = self._submit_prompt(prompt, session.session_id)
         history = self._wait_for_history(prompt_id)
         file_info = self._extract_m2m_file(history)
-        query = urlencode({key: file_info.get(key, "") for key in ("filename", "subfolder", "type")})
+        uri = self._view_uri(file_info)
+        data = self._fetch_artifact(uri)
         return ArtifactRecord(
             artifact_id=f"comfy-m2m-{prompt_id}",
             kind="audio",
-            uri=f"{self.base_url}/view?{query}",
+            uri=uri,
             mime_type="audio/mpeg",
-            checksum=None,
+            checksum=sha256(data).hexdigest(),
             duration_seconds=request.duration_seconds,
             created_at=_now(),
             provenance=[ProvenanceRecord(
@@ -922,13 +988,12 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
         if not mixed:
             raise AdapterError("ffmpeg mix produced no output")
         uploaded = self._upload_output(mixed, _sanitize_filename_prefix(session.title or "songbird-mix"))
-        query = urlencode({key: uploaded.get(key, "") for key in ("filename", "subfolder", "type")})
         return ArtifactRecord(
             artifact_id=f"comfy-mix-{uuid4().hex}",
             kind="audio",
-            uri=f"{self.base_url}/view?{query}",
+            uri=self._view_uri(uploaded),
             mime_type="audio/mpeg",
-            checksum=None,
+            checksum=sha256(mixed).hexdigest(),
             duration_seconds=request.duration_seconds,
             created_at=_now(),
             provenance=[ProvenanceRecord(
@@ -942,10 +1007,14 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
         )
 
     def _mix(self, payloads: list[bytes], gains: list[float] | None, *, mode: str = "mix", crossfade_seconds: float = 1.0) -> bytes | None:
+        with tempfile.TemporaryDirectory(prefix="songbird_mix_") as workdir:
+            return self._mix_in(Path(workdir), payloads, gains, mode=mode, crossfade_seconds=crossfade_seconds)
+
+    def _mix_in(self, workdir: Path, payloads: list[bytes], gains: list[float] | None, *, mode: str, crossfade_seconds: float) -> bytes | None:
         inputs: list[str] = []
         filter_parts: list[str] = []
         for index, payload in enumerate(payloads):
-            path = Path("/tmp") / f"mix_in_{index}_{uuid4().hex[:8]}.mp3"
+            path = workdir / f"mix_in_{index}.mp3"
             path.write_bytes(payload)
             inputs.append(str(path))
             label = f"mix{index}"
@@ -965,7 +1034,7 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
             filter_parts.append(f"[{previous}]anull[out]")
         else:
             filter_parts.append(f"{labels}amix=inputs={len(payloads)}:duration=longest:dropout_transition=0[out]")
-        output = Path("/tmp") / f"mix_out_{uuid4().hex[:8]}.mp3"
+        output = workdir / "mix_out.mp3"
         args = [self._ffmpeg, "-y"]
         for path in inputs:
             args.extend(["-i", path])
@@ -978,12 +1047,6 @@ class ComfyMixRenderAdapter(ComfyRenderAdapter):
             return mixed if mixed else None
         except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
             return None
-        finally:
-            for path in inputs + [str(output)]:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def _upload_output(self, payload: bytes, prefix: str) -> dict[str, Any]:
         boundary = "----SongbirdMix" + uuid4().hex
@@ -1027,15 +1090,19 @@ class ComfyArtifactQAAdapter:
             raise AdapterError("artifact QA requires a persisted artifact")
         if not session.artifact.uri.startswith(f"{self.base_url}/view?"):
             raise AdapterError("artifact URI is outside the configured ComfyUI view endpoint")
-        response = self._getter(Request(session.artifact.uri, method="GET"), timeout=self.timeout)
-        payload = response.read()
+        try:
+            response = self._getter(Request(session.artifact.uri, method="GET"), timeout=self.timeout)
+            if hasattr(response, "__enter__"):
+                with response as opened:
+                    payload = opened.read()
+            else:
+                payload = response.read()
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise AdapterError(f"artifact download failed: {exc}") from exc
         if not payload:
             return ArtifactQAReport(False, False, False, ["artifact response was empty"], _now())
         digest = sha256(payload).hexdigest()
-        checksum_verified = session.artifact.checksum is None or session.artifact.checksum == digest
-        findings = [f"sha256={digest}"]
-        if not checksum_verified:
-            findings.append("artifact checksum mismatch")
+        checksum_verified, findings = _checksum_findings(session.artifact.checksum, digest)
         duration = self._duration_probe(payload, session.artifact.mime_type)
         requested_duration = session.render_request.duration_seconds if session.render_request else session.artifact.duration_seconds
         submitted_duration = session.artifact.duration_seconds
@@ -1124,9 +1191,20 @@ class ComfyArtifactQAAdapter:
         return frame_count * samples_per_frame / sample_rate
 
     @staticmethod
+    def _mp3_frame_sync(payload: bytes, start: int) -> int:
+        """Return the offset of the first MPEG Layer III frame header (11 sync bits)."""
+        cursor = payload.find(b"\xff", start)
+        while cursor != -1 and cursor + 2 < len(payload):
+            second = payload[cursor + 1]
+            if (second & 0xE0) == 0xE0 and (second >> 3) & 0x3 != 1 and (second >> 1) & 0x3 == 1:
+                return cursor
+            cursor = payload.find(b"\xff", cursor + 1)
+        return -1
+
+    @staticmethod
     def _mp3_sample_rate(payload: bytes, start: int) -> int | None:
-        sync = payload.find(b"\xff\xfb", start)
-        if sync == -1 or sync + 2 > len(payload):
+        sync = ComfyArtifactQAAdapter._mp3_frame_sync(payload, start)
+        if sync == -1 or sync + 2 >= len(payload):
             return None
         index = (payload[sync + 2] >> 2) & 0x3
         version = (payload[sync + 1] >> 3) & 0x3
@@ -1139,7 +1217,7 @@ class ComfyArtifactQAAdapter:
 
     @staticmethod
     def _mp3_version(payload: bytes, start: int) -> int | None:
-        sync = payload.find(b"\xff\xfb", start)
+        sync = ComfyArtifactQAAdapter._mp3_frame_sync(payload, start)
         if sync == -1:
             return None
         return (payload[sync + 1] >> 3) & 0x3
@@ -1361,6 +1439,14 @@ class AdapterRegistry:
         except KeyError as exc:
             raise AdapterNotConfigured(f"render adapter {name!r} is not configured") from exc
 
+    def registered(self) -> dict[str, list[str]]:
+        """Return the explicitly registered adapter names by kind."""
+        return {
+            "creative": sorted(self._creative),
+            "qa": sorted(self._qa),
+            "render": sorted(self._render),
+        }
+
 
 class LocalDemucsStemAdapter:
     """HTDemucs source separation over a local source audio file.
@@ -1382,12 +1468,14 @@ class LocalDemucsStemAdapter:
         ffprobe: str = "/usr/bin/ffprobe",
         *,
         export_dir: str | Path | None = None,
+        source_root: str | Path | None = None,
         timeout: float = 1800.0,
         run_cmd=subprocess.run,
     ) -> None:
         self._demucs = demucs_bin
         self._ffprobe = ffprobe
         self._export_dir = Path(export_dir) if export_dir is not None else None
+        self._source_root = Path(source_root) if source_root is not None else None
         self.timeout = timeout
         self._run_cmd = run_cmd
         self._cache: dict[str, dict[str, Path]] = {}
@@ -1405,9 +1493,14 @@ class LocalDemucsStemAdapter:
         stem = request.parameters.get("stem")
         if stem not in self.STEMS:
             raise AdapterError(f"parameters.stem must be one of {', '.join(self.STEMS)}")
-        stems = self._separate(source)
+        if not isinstance(source, str):
+            raise AdapterError("parameters.source_audio_uri must be a string path")
+        stems = self._separate(_resolve_source_path(source, self._source_root))
         if stem not in stems:
             raise AdapterError(f"demucs produced no {stem!r} stem")
+        duration = self._probe_duration(stems[stem])
+        if duration <= 0:
+            raise AdapterError(f"could not probe duration of demucs {stem!r} stem")
         local = self._export(stems[stem], session, request, stem)
         return ArtifactRecord(
             artifact_id=f"demucs-{stem}-{uuid4().hex}",
@@ -1415,7 +1508,7 @@ class LocalDemucsStemAdapter:
             uri=f"file://{local}",
             mime_type="audio/mpeg",
             checksum=sha256(local.read_bytes()).hexdigest(),
-            duration_seconds=self._probe_duration(local),
+            duration_seconds=duration,
             created_at=_now(),
             provenance=[ProvenanceRecord(
                 provider="demucs",
@@ -1432,22 +1525,20 @@ class LocalDemucsStemAdapter:
             )],
         )
 
-    def _separate(self, source: str) -> dict[str, Path]:
-        if not Path(source).is_file():
-            raise AdapterError(f"demucs source file not found: {source}")
-        digest = sha256(Path(source).read_bytes()).hexdigest()
-        key = f"{digest[:16]}|{Path(source).stat().st_size}"
+    def _separate(self, source: Path) -> dict[str, Path]:
+        digest = sha256(source.read_bytes()).hexdigest()
+        key = f"{digest[:16]}|{source.stat().st_size}"
         cached = self._cache.get(key)
-        if cached is not None:
+        if cached is not None and all(path.is_file() for path in cached.values()):
             return cached
-        workdir = Path("/tmp") / f"demucs_{uuid4().hex[:8]}"
-        workdir.mkdir(parents=True, exist_ok=True)
+        # Kept (not auto-deleted) because the per-source cache points into it.
+        workdir = Path(tempfile.mkdtemp(prefix="songbird_demucs_"))
         args = [
             self._demucs,
             "-n", "htdemucs",
             "--mp3",
             "--out", str(workdir),
-            str(Path(source).resolve()),
+            str(source),
         ]
         try:
             result = self._run_cmd(args, capture_output=True, timeout=self.timeout)
@@ -1470,7 +1561,9 @@ class LocalDemucsStemAdapter:
         if self._export_dir is None:
             raise AdapterError("demucs export directory is not configured")
         stem_path = Path(stem_path)
-        target = self._export_dir / f"{_sanitize_filename_prefix(session.title or 'stem')}_{stem}.mp3"
+        # Session id + idempotency hash keep same-titled sessions from overwriting each other.
+        suffix = sha256(f"{session.session_id}:{request.idempotency_key}".encode()).hexdigest()[:12]
+        target = self._export_dir / f"{_sanitize_filename_prefix(session.title or 'stem')}_{stem}_{suffix}.mp3"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(stem_path.read_bytes())
         return target
@@ -1497,9 +1590,11 @@ class LocalArtifactQAAdapter:
         self,
         ffprobe: str = "/usr/bin/ffprobe",
         *,
+        artifact_root: str | Path | None = None,
         run_cmd=subprocess.run,
     ) -> None:
         self._ffprobe = ffprobe
+        self._artifact_root = Path(artifact_root) if artifact_root is not None else None
         self._run_cmd = run_cmd
 
     def evaluate(self, session: SongSession) -> ArtifactQAReport:
@@ -1508,14 +1603,18 @@ class LocalArtifactQAAdapter:
         uri = session.artifact.uri
         if not uri.startswith("file://"):
             raise AdapterError("local artifact QA requires a file:// artifact URI")
-        path = Path(uri[len("file://"):])
+        if self._artifact_root is None:
+            raise AdapterError("local artifact verification is disabled; configure SONGBIRD_DEMUCS_EXPORT_DIR")
+        try:
+            path = Path(uri[len("file://"):]).resolve()
+        except (OSError, ValueError) as exc:
+            raise AdapterError("artifact path is invalid") from exc
+        if not path.is_relative_to(self._artifact_root.resolve()):
+            raise AdapterError("artifact path is outside the configured artifact root")
         if not path.is_file():
             return ArtifactQAReport(False, False, False, ["artifact file missing"], _now())
         digest = sha256(path.read_bytes()).hexdigest()
-        checksum_verified = session.artifact.checksum is None or session.artifact.checksum == digest
-        findings = [f"sha256={digest}"]
-        if not checksum_verified:
-            findings.append("artifact checksum mismatch")
+        checksum_verified, findings = _checksum_findings(session.artifact.checksum, digest)
         duration = self._probe_duration(path)
         requested_duration = session.render_request.duration_seconds if session.render_request else session.artifact.duration_seconds
         submitted_duration = session.artifact.duration_seconds
@@ -1539,6 +1638,8 @@ class LocalArtifactQAAdapter:
                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
                 capture_output=True, check=False, timeout=10,
             )
-            return float(result.stdout.decode("utf-8").strip())
+            value = float(result.stdout.decode("utf-8").strip())
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return None
+        # A corrupt file can make ffprobe report nan/inf; treat that as an unsupported probe.
+        return value if math.isfinite(value) and value > 0 else None

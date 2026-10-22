@@ -357,6 +357,7 @@ def test_comfy_render_adapter_submits_approved_workflow_and_returns_remote_artif
     assert artifact.mime_type == "audio/mpeg"
     assert artifact.provenance[0].request_id == "prompt-123"
     assert posts[0]["prompt"]["35"]["inputs"]["filename_prefix"] == "audio/Adapter Smoke"
+    assert artifact.checksum == sha256(b"MP3BYTES").hexdigest()
     exported = list(export_dir.glob("*.mp3"))
     assert len(exported) == 1
     assert exported[0].read_bytes() == b"MP3BYTES"
@@ -696,7 +697,7 @@ def test_comfy_m2m_render_adapter_accepts_local_source_file(tmp_path):
         posts.append(json.loads(req.data.decode("utf-8")))
         return FakeResponse(b'{"prompt_id":"prompt-m2m-local"}')
 
-    adapter = ComfyM2MRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=get_json)
+    adapter = ComfyM2MRenderAdapter("http://comfy:8188", tmp_path, source_root=tmp_path, timeout=5, post_json=post_json, get_json=get_json)
     adapter.render(session, request)
     assert uploads and b"LOCALMP3BYTES" in uploads[0]
     prompt = posts[0]["prompt"]
@@ -736,7 +737,7 @@ def test_local_demucs_stem_adapter_returns_selected_stem_artifact(tmp_path):
         parameters={"source_audio_uri": str(source), "stem": "drums"},
     )
     session.render_request = request
-    adapter = LocalDemucsStemAdapter("demucs", export_dir=export, run_cmd=fake_run)
+    adapter = LocalDemucsStemAdapter("demucs", export_dir=export, source_root=tmp_path, run_cmd=fake_run)
     artifact = adapter.render(session, request)
     assert artifact.kind == "audio"
     assert artifact.uri.startswith("file://")
@@ -768,7 +769,7 @@ def test_local_artifact_qa_adapter_verifies_checksum_and_duration(tmp_path):
         checksum=sha256(b"STEMDATA").hexdigest(), duration_seconds=16.0, created_at="now",
         provenance=[ProvenanceRecord(provider="demucs", model="htdemucs", request_id=None, created_at="now", source="test", metadata={})],
     )
-    report = LocalArtifactQAAdapter(run_cmd=fake_run).evaluate(session)
+    report = LocalArtifactQAAdapter(artifact_root=tmp_path, run_cmd=fake_run).evaluate(session)
     assert report.passed is True
     assert report.checksum_verified is True
     assert report.duration_verified is True
@@ -1029,6 +1030,7 @@ def test_comfy_artifact_qa_verifies_wav_bytes_and_duration():
         wav_file.setsampwidth(2)
         wav_file.setframerate(8000)
         wav_file.writeframes(b"\x00\x00" * 8000)
+    session.artifact.checksum = sha256(output.getvalue()).hexdigest()
 
     report = ComfyArtifactQAAdapter("http://comfy:8188", getter=lambda request, timeout: FakeResponse(output.getvalue())).evaluate(session)
     assert report.passed is True
@@ -1065,7 +1067,7 @@ def test_comfy_artifact_qa_mp3_duration_falls_back_to_xing_header():
         kind="audio",
         uri="http://comfy:8188/view?filename=song.mp3&subfolder=audio&type=output",
         mime_type="audio/mpeg",
-        checksum=None,
+        checksum=sha256(XING_MP3).hexdigest(),
         duration_seconds=60.0,
         created_at="now",
     )
@@ -1119,7 +1121,7 @@ def test_comfy_artifact_qa_accepts_injected_mp3_duration_probe():
         kind="audio",
         uri="http://comfy:8188/view?filename=song.mp3&subfolder=audio&type=output",
         mime_type="audio/mpeg",
-        checksum=None,
+        checksum=sha256(b"mp3-bytes").hexdigest(),
         duration_seconds=4.0,
         created_at="now",
     )
@@ -1131,4 +1133,173 @@ def test_comfy_artifact_qa_accepts_injected_mp3_duration_probe():
     report = verifier.evaluate(session)
     assert report.passed is True
     assert report.duration_verified is True
+    store.close()
+
+
+def test_comfy_artifact_qa_missing_render_checksum_fails_closed():
+    _, store, session = make_session()
+    session.render_request = RenderRequest(session.session_id, "comfyui", 4.0, "idem-nochk", "now", "operator")
+    session.artifact = ArtifactRecord(
+        artifact_id="comfy-prompt-nochk",
+        kind="audio",
+        uri="http://comfy:8188/view?filename=song.mp3&subfolder=audio&type=output",
+        mime_type="audio/mpeg",
+        checksum=None,
+        duration_seconds=4.0,
+        created_at="now",
+    )
+    verifier = ComfyArtifactQAAdapter(
+        "http://comfy:8188",
+        getter=lambda request, timeout: FakeResponse(b"mp3-bytes"),
+        duration_probe=lambda payload, mime_type: 4.0,
+    )
+    report = verifier.evaluate(session)
+    assert report.passed is False
+    assert report.checksum_verified is False
+    assert any("no render-time checksum" in finding for finding in report.findings)
+    store.close()
+
+
+def test_comfy_artifact_qa_maps_transport_failure_to_adapter_error():
+    from urllib.error import URLError
+
+    _, store, session = make_session()
+    session.artifact = ArtifactRecord(
+        "comfy-x", "audio", "http://comfy:8188/view?filename=a.mp3&subfolder=&type=output", "audio/mpeg", "abc", 4.0, "now",
+    )
+
+    def getter(request, timeout):
+        raise URLError("connection refused")
+
+    with pytest.raises(AdapterError, match="artifact download failed"):
+        ComfyArtifactQAAdapter("http://comfy:8188", getter=getter).evaluate(session)
+    store.close()
+
+
+def test_comfy_render_adapter_maps_transport_failure_to_adapter_error(tmp_path):
+    from urllib.error import URLError
+
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(session.session_id, "minimax_music", 60, "idem-down", "now", "operator")
+    session.render_request = request
+    (tmp_path / "audio_minimax_music_3.json").write_text("{}", encoding="utf-8")
+
+    def post_json(req, timeout):
+        raise URLError("connection refused")
+
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5, post_json=post_json, get_json=post_json)
+    with pytest.raises(AdapterError, match="prompt submission failed"):
+        adapter.render(session, request)
+    store.close()
+
+
+def test_comfy_render_adapter_rejects_backends_owned_by_other_adapters(tmp_path):
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    request = RenderRequest(session.session_id, "demucs", 60, "idem-wrong", "now", "operator")
+    session.render_request = request
+    adapter = ComfyRenderAdapter("http://comfy:8188", tmp_path, timeout=5)
+    with pytest.raises(AdapterError, match="dedicated adapter"):
+        adapter.render(session, request)
+    store.close()
+
+
+@pytest.mark.parametrize("configure_root", [False, True])
+def test_comfy_m2m_rejects_local_source_outside_allowed_root(tmp_path, configure_root):
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"PRIVATE")
+    request = RenderRequest(
+        session.session_id, "ace_step_m2m", 30, "idem-escape", "now", "operator",
+        parameters={"source_audio_uri": str(allowed / ".." / "secret.txt")},
+    )
+    session.render_request = request
+    uploads = []
+
+    def post_json(req, timeout):
+        uploads.append(req.data)
+        raise AssertionError("nothing may be uploaded")
+
+    adapter = ComfyM2MRenderAdapter(
+        "http://comfy:8188", tmp_path, source_root=allowed if configure_root else None, timeout=5, post_json=post_json,
+    )
+    with pytest.raises(AdapterError, match="source"):
+        adapter.render(session, request)
+    assert uploads == []
+    store.close()
+
+
+def test_local_demucs_rejects_source_outside_allowed_root(tmp_path):
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDER_APPROVED.value
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(b"MP3")
+    request = RenderRequest(
+        session.session_id, "demucs_stem", 30, "idem-demucs-escape", "now", "operator",
+        parameters={"source_audio_uri": str(outside), "stem": "drums"},
+    )
+    session.render_request = request
+    runs = []
+    adapter = LocalDemucsStemAdapter(
+        "demucs", export_dir=tmp_path / "out", source_root=tmp_path / "allowed", run_cmd=lambda *a, **k: runs.append(a),
+    )
+    with pytest.raises(AdapterError, match="outside the allowed source root"):
+        adapter.render(session, request)
+    assert runs == []
+    store.close()
+
+
+def test_mp3_xing_probe_accepts_mpeg2_frame_sync():
+    # MPEG-2 Layer III, no CRC (0xFF 0xF3), 24 kHz, 576 samples per frame.
+    header = bytes([0xFF, 0xF3, 0x90 | (1 << 2), 0x00])
+    payload = header + b"\x00" * 32 + b"Xing" + b"\x00\x00\x00\x0f" + (2500).to_bytes(4, "big")
+    duration = ComfyArtifactQAAdapter._probe_mp3_duration(payload)
+    assert duration is not None
+    assert abs(duration - 2500 * 576 / 24000) < 1e-6
+
+
+def _local_artifact_session(path, checksum):
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDERING.value
+    session.render_request = RenderRequest(session.session_id, "demucs_stem", 16, "idem-local", "now", "operator")
+    session.artifact = ArtifactRecord(
+        artifact_id="demucs-x", kind="audio", uri=f"file://{path}", mime_type="audio/mpeg",
+        checksum=checksum, duration_seconds=16.0, created_at="now",
+    )
+    return store, session
+
+
+@pytest.mark.parametrize("configure_root", [False, True])
+def test_local_artifact_qa_refuses_paths_outside_artifact_root(tmp_path, configure_root):
+    outside = tmp_path / "secret.mp3"
+    outside.write_bytes(b"PRIVATE")
+    store, session = _local_artifact_session(outside, sha256(b"PRIVATE").hexdigest())
+    runs = []
+    verifier = LocalArtifactQAAdapter(
+        artifact_root=(tmp_path / "exports") if configure_root else None,
+        run_cmd=lambda *a, **k: runs.append(a),
+    )
+    with pytest.raises(AdapterError, match="artifact root|disabled"):
+        verifier.evaluate(session)
+    assert runs == []
+    store.close()
+
+
+@pytest.mark.parametrize("probe_output", [b"nan", b"inf", b"-1"])
+def test_local_artifact_qa_treats_non_finite_duration_as_unsupported(tmp_path, probe_output):
+    stem = tmp_path / "drums.mp3"
+    stem.write_bytes(b"STEM")
+    store, session = _local_artifact_session(stem, sha256(b"STEM").hexdigest())
+    verifier = LocalArtifactQAAdapter(
+        artifact_root=tmp_path,
+        run_cmd=lambda *a, **k: type("R", (), {"returncode": 0, "stdout": probe_output}),
+    )
+    report = verifier.evaluate(session)
+    assert report.passed is False
+    assert report.duration_verified is False
+    assert report.findings[-1] == "duration probe unsupported"
     store.close()

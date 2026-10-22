@@ -357,6 +357,7 @@ class SongSession:
     render_request: RenderRequest | None = None
     artifact: ArtifactRecord | None = None
     artifact_qa: ArtifactQAReport | None = None
+    render_claimed_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -389,6 +390,8 @@ class SongSession:
             raise ValueError("artifact must be an ArtifactRecord or None")
         if self.artifact_qa is not None and not isinstance(self.artifact_qa, ArtifactQAReport):
             raise ValueError("artifact_qa must be an ArtifactQAReport or None")
+        if self.render_claimed_at is not None and not isinstance(self.render_claimed_at, str):
+            raise ValueError("render_claimed_at must be a string or None")
         self.stages = list(self.stages)
 
     def to_dict(self) -> dict[str, Any]:
@@ -407,6 +410,7 @@ class SongSession:
             "render_request": self.render_request.to_dict() if self.render_request else None,
             "artifact": self.artifact.to_dict() if self.artifact else None,
             "artifact_qa": self.artifact_qa.to_dict() if self.artifact_qa else None,
+            "render_claimed_at": self.render_claimed_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

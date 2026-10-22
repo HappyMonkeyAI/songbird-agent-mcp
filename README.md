@@ -52,8 +52,10 @@ The `demucs_stem` render adapter enables HTDemucs source separation (drums/bass/
 
 1. Ensure the `demucs` binary is installed and accessible.
 2. Set the `SONGBIRD_DEMUCS_BIN` environment variable to the path of the `demucs` binary.
-3. Ensure the `htdemucs` model is available to the demucs installation.
-4. Ensure `ffprobe` is installed for duration probing (typically available via the `ffmpeg` package).
+3. Set `SONGBIRD_SOURCE_AUDIO_ROOT` to the directory that holds source audio; source paths outside it are rejected.
+   `SONGBIRD_DEMUCS_EXPORT_DIR` is also the only directory `verify_artifact` will read local `file://` artifacts from.
+4. Ensure the `htdemucs` model is available to the demucs installation.
+5. Ensure `ffprobe` is installed for duration probing (typically available via the `ffmpeg` package).
 
 ## Planned MCP surface
 
@@ -62,21 +64,22 @@ The `demucs_stem` render adapter enables HTDemucs source separation (drums/bass/
 - `get_song_session` — inspect current stage snapshots and status.
 - `get_workflow_plan` — return the recommended stage sequence for a use case.
 - `submit_creative_stage` — submit the next typed creative-stage snapshot.
+- `revise_creative_stage` — revise an already-submitted creative stage before render approval (e.g. after failed QA); later stages and QA must be redone.
 - `record_qa` — record pass/fail QA and required revisions.
 - `approve_render` — record explicit approval after QA; does not render yet.
 - `generate_musical_direction` — invoke an explicitly registered adapter and persist its typed result.
-- `render_song` — invoke an explicitly registered render adapter only after approval and persist its artifact. Supports ComfyUI workflows (MiniMax Music 3, ACE-Step M2M, FFmpeg mix) and `demucs_stem` for HTDemucs source separation (drums/bass/other/vocals) when `SONGBIRD_DEMUCS_BIN` is configured.
+- `render_song` — invoke the render adapter bound to the approved backend (an explicit `adapter_name` must match), at most once per approval, and persist its artifact. Supports ComfyUI workflows (MiniMax Music 3, ACE-Step M2M, FFmpeg mix) and `demucs_stem` for HTDemucs source separation (drums/bass/other/vocals) when `SONGBIRD_DEMUCS_BIN` is configured.
 - FFmpeg fallback assembly supports `parameters.mode=concat_crossfade` with bounded `crossfade_seconds` (0.01–5.0); this smooths boundaries but is not a vocalist-identity guarantee.
-- `qa_artifact` — verify checksum and duration integrity; only a full pass reaches `completed`.
+- `qa_artifact` — record a failing artifact QA with findings; always blocks. Completion is only reachable through `verify_artifact`.
 - `check_provider_health` — perform a read-only ComfyUI `/system_stats` check when `COMFYUI_URL` is configured.
 - `check_supporting_services` — perform read-only contract probes for configured ComfyUI, LightRAG, Perplexica, and Ollama services; reports each dependency independently.
 - `search_genius_songs` / `get_genius_song` — use configured Genius OAuth credentials or `GENIUS_ACCESS_TOKEN` for read-only song metadata and lyric-availability lookup; lyric text is not returned.
 - `search_lyric_context` — query the configured LightRAG lyric corpus in context-only mode and return references for provenance.
 - `dry_run_render` — map session stages to an ACE-Step, MiniMax, or demucs_stem render plan without side effects.
 - MiniMax dry-run plans expose `parameters.generation_mode` (`native_long_form` within the 300-second model cap, otherwise `segmented_fallback_required`) and a structured caption with `Global Metadata`, `Vocal Details`, and `Arrangement`; the latter is passed to the official MiniMax workflow as locked conditioning.
-- `verify_artifact` — fetch a configured ComfyUI view handle, compute SHA-256, and probe WAV duration before terminal QA.
+- `verify_artifact` — fetch the artifact (ComfyUI `/view` handle or local `file://`, chosen automatically), compare SHA-256 with the render-time checksum, and probe duration; the only path to `completed`.
 - MP3/FLAC duration uses fixed-argument `/usr/bin/ffprobe` over stdin when available; actual duration must match both requested and submitted duration.
-- ComfyUI rendering is opt-in when both `COMFYUI_URL` and `SONGBIRD_WORKFLOW_ROOT` are configured; it submits approved prompts and returns `/view` artifact handles without local writes.
+- ComfyUI rendering is opt-in when both `COMFYUI_URL` and `SONGBIRD_WORKFLOW_ROOT` are configured; it submits approved prompts, records a render-time SHA-256 of the produced bytes, and returns `/view` artifact handles; local export happens only when `SONGBIRD_OUTPUT_DIR` is set.
 - `adapters.py` provides provider-neutral creative, QA, and render protocols plus deterministic mocks for local tests.
 - `OllamaMusicDirectionAdapter` is available as an opt-in adapter for the verified Ollama `/api/generate` JSON contract; it is not auto-registered.
 - Future: provider-backed `generate_persona`, `generate_lyrics`, `generate_instrumental_prompt`, and artifact validator implementations.
