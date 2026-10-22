@@ -7,7 +7,7 @@ The intended interaction is: an agent creates a session, develops a brief/person
 ## Status
 Phase 1 control plane with working ComfyUI render integration. The server persists sessions, enforces creative-stage order, records QA, records explicit render approval, and renders approved sessions through configurable ComfyUI adapters (MiniMax Music 3, ACE-Step M2M style transfer, FFmpeg layer mixing), verifying artifact checksum and duration before completing. Optional LLM musical-direction adapters (Ollama, OpenAI-compatible) are opt-in via environment.
 
-* This is an early access build to encourage other to download it and share feedback to help in improving features and identifying bugs
+* This is an early access build to encourage others to download it and share feedback to help in improving features and identifying bugs
 
 ## Quick start
 
