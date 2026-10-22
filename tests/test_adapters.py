@@ -769,7 +769,7 @@ def test_local_artifact_qa_adapter_verifies_checksum_and_duration(tmp_path):
         checksum=sha256(b"STEMDATA").hexdigest(), duration_seconds=16.0, created_at="now",
         provenance=[ProvenanceRecord(provider="demucs", model="htdemucs", request_id=None, created_at="now", source="test", metadata={})],
     )
-    report = LocalArtifactQAAdapter(run_cmd=fake_run).evaluate(session)
+    report = LocalArtifactQAAdapter(artifact_root=tmp_path, run_cmd=fake_run).evaluate(session)
     assert report.passed is True
     assert report.checksum_verified is True
     assert report.duration_verified is True
@@ -1260,3 +1260,46 @@ def test_mp3_xing_probe_accepts_mpeg2_frame_sync():
     duration = ComfyArtifactQAAdapter._probe_mp3_duration(payload)
     assert duration is not None
     assert abs(duration - 2500 * 576 / 24000) < 1e-6
+
+
+def _local_artifact_session(path, checksum):
+    _, store, session = make_session()
+    session.status = SessionStatus.RENDERING.value
+    session.render_request = RenderRequest(session.session_id, "demucs_stem", 16, "idem-local", "now", "operator")
+    session.artifact = ArtifactRecord(
+        artifact_id="demucs-x", kind="audio", uri=f"file://{path}", mime_type="audio/mpeg",
+        checksum=checksum, duration_seconds=16.0, created_at="now",
+    )
+    return store, session
+
+
+@pytest.mark.parametrize("configure_root", [False, True])
+def test_local_artifact_qa_refuses_paths_outside_artifact_root(tmp_path, configure_root):
+    outside = tmp_path / "secret.mp3"
+    outside.write_bytes(b"PRIVATE")
+    store, session = _local_artifact_session(outside, sha256(b"PRIVATE").hexdigest())
+    runs = []
+    verifier = LocalArtifactQAAdapter(
+        artifact_root=(tmp_path / "exports") if configure_root else None,
+        run_cmd=lambda *a, **k: runs.append(a),
+    )
+    with pytest.raises(AdapterError, match="artifact root|disabled"):
+        verifier.evaluate(session)
+    assert runs == []
+    store.close()
+
+
+@pytest.mark.parametrize("probe_output", [b"nan", b"inf", b"-1"])
+def test_local_artifact_qa_treats_non_finite_duration_as_unsupported(tmp_path, probe_output):
+    stem = tmp_path / "drums.mp3"
+    stem.write_bytes(b"STEM")
+    store, session = _local_artifact_session(stem, sha256(b"STEM").hexdigest())
+    verifier = LocalArtifactQAAdapter(
+        artifact_root=tmp_path,
+        run_cmd=lambda *a, **k: type("R", (), {"returncode": 0, "stdout": probe_output}),
+    )
+    report = verifier.evaluate(session)
+    assert report.passed is False
+    assert report.duration_verified is False
+    assert report.findings[-1] == "duration probe unsupported"
+    store.close()

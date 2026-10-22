@@ -1590,9 +1590,11 @@ class LocalArtifactQAAdapter:
         self,
         ffprobe: str = "/usr/bin/ffprobe",
         *,
+        artifact_root: str | Path | None = None,
         run_cmd=subprocess.run,
     ) -> None:
         self._ffprobe = ffprobe
+        self._artifact_root = Path(artifact_root) if artifact_root is not None else None
         self._run_cmd = run_cmd
 
     def evaluate(self, session: SongSession) -> ArtifactQAReport:
@@ -1601,7 +1603,14 @@ class LocalArtifactQAAdapter:
         uri = session.artifact.uri
         if not uri.startswith("file://"):
             raise AdapterError("local artifact QA requires a file:// artifact URI")
-        path = Path(uri[len("file://"):])
+        if self._artifact_root is None:
+            raise AdapterError("local artifact verification is disabled; configure SONGBIRD_DEMUCS_EXPORT_DIR")
+        try:
+            path = Path(uri[len("file://"):]).resolve()
+        except (OSError, ValueError) as exc:
+            raise AdapterError("artifact path is invalid") from exc
+        if not path.is_relative_to(self._artifact_root.resolve()):
+            raise AdapterError("artifact path is outside the configured artifact root")
         if not path.is_file():
             return ArtifactQAReport(False, False, False, ["artifact file missing"], _now())
         digest = sha256(path.read_bytes()).hexdigest()
@@ -1629,6 +1638,8 @@ class LocalArtifactQAAdapter:
                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
                 capture_output=True, check=False, timeout=10,
             )
-            return float(result.stdout.decode("utf-8").strip())
+            value = float(result.stdout.decode("utf-8").strip())
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return None
+        # A corrupt file can make ffprobe report nan/inf; treat that as an unsupported probe.
+        return value if math.isfinite(value) and value > 0 else None

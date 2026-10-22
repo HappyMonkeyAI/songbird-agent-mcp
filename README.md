@@ -53,6 +53,7 @@ The `demucs_stem` render adapter enables HTDemucs source separation (drums/bass/
 1. Ensure the `demucs` binary is installed and accessible.
 2. Set the `SONGBIRD_DEMUCS_BIN` environment variable to the path of the `demucs` binary.
 3. Set `SONGBIRD_SOURCE_AUDIO_ROOT` to the directory that holds source audio; source paths outside it are rejected.
+   `SONGBIRD_DEMUCS_EXPORT_DIR` is also the only directory `verify_artifact` will read local `file://` artifacts from.
 4. Ensure the `htdemucs` model is available to the demucs installation.
 5. Ensure `ffprobe` is installed for duration probing (typically available via the `ffmpeg` package).
 

@@ -50,7 +50,10 @@ _supporting_health_adapters: dict[str, JsonHTTPHealthAdapter] = {}
 _genius_adapter: GeniusAPIAdapter | None = None
 _lightrag_query_adapter: LightRAGQueryAdapter | None = None
 _artifact_qa_adapters: dict[str, Any] = {
-    "local": LocalArtifactQAAdapter(os.environ.get("SONGBIRD_FFPROBE", "/usr/bin/ffprobe")),
+    "local": LocalArtifactQAAdapter(
+        os.environ.get("SONGBIRD_FFPROBE", "/usr/bin/ffprobe"),
+        artifact_root=os.environ.get("SONGBIRD_DEMUCS_EXPORT_DIR"),
+    ),
 }
 _dry_run_adapter = SongbirdDryRunAdapter()
 _source_audio_root = os.environ.get("SONGBIRD_SOURCE_AUDIO_ROOT")
