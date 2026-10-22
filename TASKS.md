@@ -20,7 +20,7 @@
 - [x] Add explicit render execution tool with approval, idempotency, and artifact persistence gates.
 - [x] Add artifact QA report, integrity checks, and terminal completed/blocked transitions.
 - [ ] Add Songbird/LLM/research/ComfyUI implementations behind the interfaces.
-- [ ] Add mocked adapters and revision loop.
+- [x] Add mocked adapters and revision loop.
 - [x] Support instrumental-only use cases without lyric stages.
 
 ## Phase 3 — Songbird integration
@@ -40,6 +40,12 @@
 - [x] Add MP3/FLAC duration probing and requested/submitted/actual duration reconciliation.
 - [ ] Verify artifact metadata and lyric/prompt QA.
 - [ ] Block invalid artifacts and expose actionable revision suggestions.
+- [x] Fail closed on missing render-time checksums; make `verify_artifact` the only completion path (ADR 0019).
+- [x] Bind render adapter to approved backend and claim session before provider side effects (ADR 0019).
+- [x] Confine local source audio to `SONGBIRD_SOURCE_AUDIO_ROOT` (ADR 0019).
+- [ ] Replace self-declared `approved_by` with a human-issued approval token.
+- [ ] Recover stale `render_claimed_at` claims after a process crash.
+- [ ] Run long renders off the event loop (async tools) so stdio stays responsive.
 
 ## Phase 5 — client integration
 - [ ] Register local stdio server with Hermes/Dynamic MCP Proxy after smoke gates pass.

@@ -38,21 +38,23 @@ The current server persists session snapshots, enforces ordered creative stages,
 
 An opt-in `OllamaMusicDirectionAdapter` now exists behind the adapter boundary. It is source-verified and transport-tested, but intentionally not registered by the MCP server or invoked automatically.
 
-Render execution is also explicit: `render_song` requires the persisted approval request, enforces the adapter-returned artifact boundary, and leaves the session at `rendering` until artifact QA is implemented.
+Render execution is also explicit: `render_song` requires the persisted approval request, derives the only permitted adapter from the approved backend, claims the session (`render_claimed_at`) under the optimistic revision lock before any provider call, and leaves the session at `rendering` until artifact QA. A provider failure releases the claim (ADR 0019).
 
-Artifact QA is now the terminal gate: `qa_artifact` persists checksum/duration findings and transitions to `completed` only when every integrity check passes; otherwise the session is `blocked`.
+Artifact QA is now the terminal gate: only `verify_artifact`, which inspects the artifact bytes, can transition to `completed`, and a missing render-time checksum fails closed. `qa_artifact` records a failing report with findings and blocks the session (ADR 0019).
+
+Failed QA is recoverable: `revise_creative_stage` appends a new revision of a submitted creative stage before render approval, rewinds to it, and requires later stages and QA to be redone.
 
 Provider hardening now includes a read-only `ComfyHealthAdapter` for the source-verified `/system_stats` endpoint. It is registered only from `COMFYUI_URL`; startup remains network-free.
 
 Songbird mapping is available through `dry_run_render`: it normalizes ACE-Step/MiniMax profile aliases, maps stage fields, applies the verified MiniMax 300-second cap, and never submits work or persists a revision.
 
-The ComfyUI render adapter is now opt-in from `COMFYUI_URL` plus `SONGBIRD_WORKFLOW_ROOT`. It submits approved prompts, polls history, and returns a remote `/view` artifact handle; it does not download files or bypass artifact QA.
+The ComfyUI render adapter is now opt-in from `COMFYUI_URL` plus `SONGBIRD_WORKFLOW_ROOT`. It submits approved prompts, polls history, downloads the produced bytes once to record a render-time SHA-256, and returns a remote `/view` artifact handle; it does not bypass artifact QA.
 
 `verify_artifact` verifies ComfyUI bytes and SHA-256 and probes WAV duration through the configured `/view` endpoint. MP3/FLAC duration uses the fixed ffprobe path documented below and fails closed when unavailable or invalid.
 
 MP3/FLAC duration probing is now supported through fixed-argument `/usr/bin/ffprobe` stdin input, with a stdlib Xing/Info header fallback for MP3 when ffprobe cannot report a duration on a non-seekable pipe. The verifier reconciles actual, approved-requested, and persisted-submitted durations and fails closed on any mismatch or probe failure.
 
-`approve_render` now carries an optional provider-neutral `parameters` map on the render request, and a second render adapter `comfyui_m2m` is registered from the same `COMFYUI_URL` + `SONGBIRD_WORKFLOW_ROOT` pair. It performs an ACE-Step music-to-music second pass: the approved `parameters.source_audio_uri` (a `/view` handle on the same instance) is downloaded, uploaded into the ComfyUI input folder, and the M2M edit workflow (`audio_ace_step_m2m_edit.json`) is submitted with the session's tags/lyrics as the new style caption. Duration and checksum are verified by `verify_artifact` as usual; the M2M pass preserves the source duration.
+`approve_render` now carries an optional provider-neutral `parameters` map on the render request, and a second render adapter `comfyui_m2m` is registered from the same `COMFYUI_URL` + `SONGBIRD_WORKFLOW_ROOT` pair. It performs an ACE-Step music-to-music second pass: the approved `parameters.source_audio_uri` (a `/view` handle on the same instance, or a local file under `SONGBIRD_SOURCE_AUDIO_ROOT`) is downloaded, uploaded into the ComfyUI input folder, and the M2M edit workflow (`audio_ace_step_m2m_edit.json`) is submitted with the session's tags/lyrics as the new style caption. Duration and checksum are verified by `verify_artifact` as usual; the M2M pass preserves the source duration.
 
 Title-derived ComfyUI save prefixes are sanitized for Windows-host filesystems (`<>:"/\|?*` replaced, empty results fall back to `songbird`), because ComfyUI runs on Windows and illegal characters abort the save node.
 
@@ -64,6 +66,7 @@ A third render adapter `comfyui_mix` (backend `ffmpeg_mix`) layers two or more `
 - FastMCP / MCP Python SDK
 - stdio first; no required network port
 - `SONGBIRD_AGENT_DB` selects the SQLite snapshot path; default `:memory:` is isolated per process.
+- `SONGBIRD_SOURCE_AUDIO_ROOT` confines local source audio for M2M and Demucs; unset means local sources are rejected.
 
 ## Non-goals for the first implementation phase
 - Reimplementing Songbird agents inside the MCP server
